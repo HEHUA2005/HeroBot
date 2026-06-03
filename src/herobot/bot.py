@@ -56,6 +56,7 @@ HELP_TEXT = """可用命令：
 /chatid - 查看当前 chat id
 /contacts - 查看联系人
 /calendar - 查看近期日程
+/calender - /calendar 的常见拼写别名
 /availability - 查看近期空闲
 /pending - 查看待确认约时间
 
@@ -585,6 +586,18 @@ async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message is None:
+        return
+    if not is_allowed(update, context):
+        if update.effective_chat and update.effective_chat.type == "private":
+            await reject_unauthorized(update)
+        return
+    await update.effective_message.reply_text(
+        "没识别这个命令。常用命令：/help、/calendar、/contacts、/availability、/pending"
+    )
+
+
 async def availability_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message is None:
         return
@@ -633,6 +646,7 @@ async def maybe_confirm_scheduling(update: Update, context: ContextTypes.DEFAULT
     if message is None or user is None or chat is None:
         return False
     text = message.text or ""
+    clean_text = strip_bot_mention(text, context).strip()
     if "取消这次约时间" in text:
         if not is_owner(update, context):
             return True
@@ -643,8 +657,27 @@ async def maybe_confirm_scheduling(update: Update, context: ContextTypes.DEFAULT
         await message.reply_text("已取消这次约时间。")
         return True
     import re
-    match = re.search(r"确认第\s*(\d+)\s*个时间", text)
-    if not match:
+    explicit_match = re.search(r"(?:确认|选|定)?\s*第?\s*(\d+)\s*个(?:时间|候选)?", clean_text)
+    chinese_index = {"一": 0, "二": 1, "三": 2}
+    chinese_match = re.search(r"(?:确认|选|定)?\s*第?\s*([一二三])\s*个(?:时间|候选)?", clean_text)
+    soft_confirmation_words = {
+        "可以",
+        "可以的",
+        "好",
+        "好的",
+        "行",
+        "行的",
+        "ok",
+        "okay",
+        "确认",
+        "确定",
+        "就这个",
+        "定这个",
+        "没问题",
+    }
+    normalized = clean_text.lower().replace("。", "").replace("！", "").replace("!", "").strip()
+    soft_confirmed = normalized in soft_confirmation_words and await is_addressed_to_bot(update, context)
+    if not explicit_match and not chinese_match and not soft_confirmed:
         return False
     if not is_owner(update, context):
         await message.reply_text("只有主人可以确认日程。")
@@ -654,7 +687,12 @@ async def maybe_confirm_scheduling(update: Update, context: ContextTypes.DEFAULT
     if session is None or not session["candidates"]:
         await message.reply_text("没有可确认的候选时间。")
         return True
-    index = int(match.group(1)) - 1
+    if explicit_match:
+        index = int(explicit_match.group(1)) - 1
+    elif chinese_match:
+        index = chinese_index[chinese_match.group(1)]
+    else:
+        index = 0
     if index < 0 or index >= len(session["candidates"]):
         await message.reply_text("候选序号不对。")
         return True
@@ -776,10 +814,11 @@ def build_application(
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("contacts", contacts_command))
-    app.add_handler(CommandHandler("calendar", calendar_command))
+    app.add_handler(CommandHandler(["calendar", "calender"], calendar_command))
     app.add_handler(CommandHandler("availability", availability_command))
     app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     return app
