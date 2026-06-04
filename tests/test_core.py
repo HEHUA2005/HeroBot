@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from herobot.bot import parse_allowed_user_ids, parse_bool
+from herobot.bot import parse_allowed_user_ids, parse_bool, parse_scheduling_confirmation
 from herobot.agent import note_search_terms
 from herobot.bot2bot import (
     build_collaboration_prompt,
@@ -42,6 +42,18 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(parse_bool("false", True))
         self.assertFalse(parse_bool("0", True))
         self.assertTrue(parse_bool(None, True))
+
+    def test_parse_scheduling_confirmation(self) -> None:
+        self.assertEqual(parse_scheduling_confirmation("可以", True), 0)
+        self.assertIsNone(parse_scheduling_confirmation("可以", False))
+        self.assertEqual(parse_scheduling_confirmation("确认第 1 个时间", False), 0)
+        self.assertEqual(parse_scheduling_confirmation("选第二个", False), 1)
+        self.assertIsNone(
+            parse_scheduling_confirmation(
+                "帮我记一下我的学校是上海交通大学，再帮我添加一个联系人 李雷 他的bot是 @HEHUAone_bot",
+                True,
+            )
+        )
 
     def test_bot_to_bot_helpers(self) -> None:
         self.assertEqual(parse_bot_usernames("@Other_Bot, review_bot"), {"other_bot", "review_bot"})

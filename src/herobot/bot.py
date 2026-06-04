@@ -176,6 +176,60 @@ def format_slots(slots: list[TimeWindow], timezone_name: str) -> str:
     )
 
 
+def parse_scheduling_confirmation(text: str, allow_soft_confirmation: bool) -> int | None:
+    import re
+
+    normalized = (
+        text.lower()
+        .replace("。", "")
+        .replace("！", "")
+        .replace("!", "")
+        .replace("，", "")
+        .replace(",", "")
+        .strip()
+    )
+    soft_confirmation_words = {
+        "可以",
+        "可以的",
+        "好",
+        "好的",
+        "行",
+        "行的",
+        "ok",
+        "okay",
+        "确认",
+        "确定",
+        "就这个",
+        "定这个",
+        "没问题",
+    }
+    if allow_soft_confirmation and normalized in soft_confirmation_words:
+        return 0
+
+    explicit_patterns = [
+        r"^(?:确认|选|选择|定)\s*第?\s*(\d+)\s*(?:个)?(?:时间|候选)?$",
+        r"^第\s*(\d+)\s*个(?:时间|候选)?$",
+        r"^第\s*(\d+)\s*(?:时间|候选)$",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return int(match.group(1)) - 1
+
+    chinese_index = {"一": 0, "二": 1, "三": 2}
+    chinese_patterns = [
+        r"^(?:确认|选|选择|定)\s*第?\s*([一二三])\s*(?:个)?(?:时间|候选)?$",
+        r"^第\s*([一二三])\s*个(?:时间|候选)?$",
+        r"^第\s*([一二三])\s*(?:时间|候选)$",
+    ]
+    for pattern in chinese_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return chinese_index[match.group(1)]
+
+    return None
+
+
 async def owner_events_for_window(
     context: ContextTypes.DEFAULT_TYPE, user_id: int, window: TimeWindow
 ) -> list[dict]:
@@ -656,28 +710,11 @@ async def maybe_confirm_scheduling(update: Update, context: ContextTypes.DEFAULT
             await storage.set_scheduling_status(session["id"], "cancelled")
         await message.reply_text("已取消这次约时间。")
         return True
-    import re
-    explicit_match = re.search(r"(?:确认|选|定)?\s*第?\s*(\d+)\s*个(?:时间|候选)?", clean_text)
-    chinese_index = {"一": 0, "二": 1, "三": 2}
-    chinese_match = re.search(r"(?:确认|选|定)?\s*第?\s*([一二三])\s*个(?:时间|候选)?", clean_text)
-    soft_confirmation_words = {
-        "可以",
-        "可以的",
-        "好",
-        "好的",
-        "行",
-        "行的",
-        "ok",
-        "okay",
-        "确认",
-        "确定",
-        "就这个",
-        "定这个",
-        "没问题",
-    }
-    normalized = clean_text.lower().replace("。", "").replace("！", "").replace("!", "").strip()
-    soft_confirmed = normalized in soft_confirmation_words and await is_addressed_to_bot(update, context)
-    if not explicit_match and not chinese_match and not soft_confirmed:
+    index = parse_scheduling_confirmation(
+        clean_text,
+        allow_soft_confirmation=await is_addressed_to_bot(update, context),
+    )
+    if index is None:
         return False
     if not is_owner(update, context):
         await message.reply_text("只有主人可以确认日程。")
@@ -687,12 +724,6 @@ async def maybe_confirm_scheduling(update: Update, context: ContextTypes.DEFAULT
     if session is None or not session["candidates"]:
         await message.reply_text("没有可确认的候选时间。")
         return True
-    if explicit_match:
-        index = int(explicit_match.group(1)) - 1
-    elif chinese_match:
-        index = chinese_index[chinese_match.group(1)]
-    else:
-        index = 0
     if index < 0 or index >= len(session["candidates"]):
         await message.reply_text("候选序号不对。")
         return True
