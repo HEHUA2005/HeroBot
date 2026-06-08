@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -10,23 +12,16 @@ from zoneinfo import ZoneInfo
 from herobot.bot import parse_allowed_user_ids, parse_bool, parse_scheduling_confirmation
 from herobot.agent import note_search_terms
 from herobot.bot2bot import (
-    build_collaboration_prompt,
-    build_followup_prompt,
-    build_request_message,
-    build_synthesis_prompt,
-    choose_target_bot,
-    clean_user_request,
+    extract_mentions,
     first_mentioned_bot,
     is_first_mentioned_bot,
-    is_natural_bot_request,
-    looks_like_delegation,
-    natural_request_body,
-    parse_bot_call,
     parse_bot_usernames,
-    strip_envelope,
 )
 from herobot.storage import Storage
-from herobot.tools import ToolContext, ToolRunner, calculate
+from herobot.tools import BusinessTools, ToolContext
+from herobot.tool_registry import MCPToolConfig, MCPToolRegistry
+from herobot.agent import Agent, AgentEvent
+from herobot.platform import RecordingPlatformTools
 from herobot.scheduling import TimeWindow, find_free_windows, intersect_windows, parse_iso_text_window, to_utc_iso
 
 
@@ -58,59 +53,10 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_bot_to_bot_helpers(self) -> None:
         self.assertEqual(parse_bot_usernames("@Other_Bot, review_bot"), {"other_bot", "review_bot"})
         text = "@super666666_bot 请你和 @other_bot 讨论一下这个数学问题"
-        self.assertTrue(looks_like_delegation(text, "super666666_bot"))
-        self.assertFalse(looks_like_delegation(text, "other_bot"))
+        self.assertEqual(extract_mentions(text), ["super666666_bot", "other_bot"])
         self.assertEqual(first_mentioned_bot(text), "super666666_bot")
         self.assertTrue(is_first_mentioned_bot(text, "super666666_bot"))
         self.assertFalse(is_first_mentioned_bot(text, "other_bot"))
-        self.assertEqual(choose_target_bot(text, "super666666_bot"), "other_bot")
-        self.assertEqual(
-            clean_user_request(text, "other_bot", "super666666_bot"),
-            "这个数学问题",
-        )
-
-        request = build_request_message(
-            target_username="other_bot",
-            from_username="super666666_bot",
-            call_id="abc123",
-            request="讨论一下这个数学问题",
-            max_depth=3,
-        )
-        call = parse_bot_call(request)
-        self.assertIsNone(call)
-        self.assertTrue(is_natural_bot_request(request, "other_bot"))
-        self.assertIn("讨论一下这个数学问题", natural_request_body(request, "other_bot"))
-        self.assertIn("讨论一下这个数学问题", strip_envelope(request))
-        self.assertIn("你怎么看", request)
-        self.assertNotIn("请回答这个问题或任务", request)
-        self.assertNotIn("你正在和另一个 Telegram bot", request)
-        self.assertNotIn("[herobot-depth:", request)
-        self.assertNotIn("[herobot-call-id:", request)
-        collaboration = build_collaboration_prompt("问题")
-        self.assertIn("使用纯文本", collaboration)
-        self.assertIn("不要 Markdown", collaboration)
-        self.assertIn("不要每轮都固定追问", collaboration)
-        followup_request = build_request_message(
-            target_username="other_bot",
-            from_username="super666666_bot",
-            call_id="abc123",
-            request="继续追问",
-            max_depth=3,
-            depth=2,
-        )
-        self.assertNotIn("[herobot-depth:", followup_request)
-
-        followup = build_followup_prompt("other_bot", "问题", "观点")
-        self.assertIn("作为发起方参与讨论", followup)
-        self.assertIn("不要用问题结尾", followup)
-        self.assertIn("不要写最终结论", followup)
-
-        synthesis = build_synthesis_prompt("other_bot", "问题", "观点")
-        self.assertIn("不要说", synthesis)
-        self.assertIn("150 字以内", synthesis)
-
-    def test_calculate(self) -> None:
-        self.assertEqual(calculate("1 + 2 * 3"), "7")
 
     def test_note_search_terms(self) -> None:
         self.assertIn("护照", note_search_terms("我护照在哪里？"))
@@ -119,21 +65,19 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(str(Path(tmp) / "test.sqlite3"))
             await storage.init()
-            runner = ToolRunner(storage)
+            tools = BusinessTools(storage)
             context = ToolContext(chat_id=10, user_id=20)
 
-            todo = json.loads(await runner.run("create_todo", {"title": "买牛奶"}, context))
+            todo = await tools.invoke("create_todo", {"title": "买牛奶"}, context)
             self.assertTrue(todo["ok"])
             todos = await storage.list_todos(10)
             self.assertEqual(todos[0]["title"], "买牛奶")
 
-            note = json.loads(
-                await runner.run(
+            note = await tools.invoke(
                     "create_note",
                     {"title": "护照", "content": "放在抽屉里"},
                     context,
                 )
-            )
             self.assertTrue(note["ok"])
             notes = await storage.search_notes(10, "护照")
             self.assertEqual(notes[0]["content"], "放在抽屉里")
@@ -144,16 +88,14 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(str(Path(tmp) / "test.sqlite3"))
             await storage.init()
-            runner = ToolRunner(storage)
+            tools = BusinessTools(storage)
             context = ToolContext(chat_id=10, user_id=20)
 
-            result = json.loads(
-                await runner.run(
+            result = await tools.invoke(
                     "create_reminder",
                     {"content": "喝水", "remind_at": "2026-05-28T14:30:00+08:00"},
                     context,
                 )
-            )
 
             self.assertTrue(result["ok"])
             remind_at = datetime.fromisoformat(result["result"]["remind_at"])
@@ -189,6 +131,148 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(common), 1)
             self.assertEqual(common[0].start.hour, 9)
             self.assertEqual(common[0].start.minute, 0)
+
+    async def test_mcp_registry_lists_and_calls_business_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["HEROBOT_DB_PATH"] = str(Path(tmp) / "mcp.sqlite3")
+            env["PYTHONPATH"] = str(Path.cwd() / "src")
+            registry = MCPToolRegistry(
+                MCPToolConfig(
+                    command=sys.executable,
+                    args=["-m", "herobot.mcp_server"],
+                    env=env,
+                )
+            )
+            await registry.start()
+            try:
+                schemas = registry.openai_tool_schemas()
+                self.assertIn("create_note", {item["function"]["name"] for item in schemas})
+                create_note_schema = next(
+                    item for item in schemas if item["function"]["name"] == "create_note"
+                )
+                self.assertNotIn(
+                    "herobot_context",
+                    create_note_schema["function"]["parameters"].get("properties", {}),
+                )
+                context = ToolContext(chat_id=10, user_id=20, owner_user_id=20)
+                result = json.loads(
+                    await registry.call(
+                        "create_note",
+                        {"title": "学校", "content": "上海交通大学"},
+                        context,
+                    )
+                )
+                self.assertTrue(result["ok"])
+            finally:
+                await registry.close()
+
+    async def test_agent_runtime_uses_mcp_and_finish_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            db_path = str(Path(tmp) / "agent.sqlite3")
+            env["HEROBOT_DB_PATH"] = db_path
+            env["PYTHONPATH"] = str(Path.cwd() / "src")
+            storage = Storage(db_path)
+            await storage.init()
+            registry = MCPToolRegistry(
+                MCPToolConfig(
+                    command=sys.executable,
+                    args=["-m", "herobot.mcp_server"],
+                    env=env,
+                )
+            )
+            await registry.start()
+            try:
+                llm = FakeLLM(
+                    [
+                        [
+                            FakeToolCall(
+                                "1",
+                                "create_note",
+                                {"title": "学校", "content": "上海交通大学"},
+                            ),
+                            FakeToolCall(
+                                "2",
+                                "send_telegram_message",
+                                {"text": "已记录学校。"},
+                            ),
+                            FakeToolCall(
+                                "3",
+                                "finish_task",
+                                {
+                                    "status": "done",
+                                    "summary": "saved note",
+                                    "needs_user_input": False,
+                                },
+                            ),
+                        ]
+                    ]
+                )
+                agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=3)
+                event = AgentEvent(
+                    source="telegram",
+                    chat_id=10,
+                    chat_type="private",
+                    message_id=1,
+                    sender_id=20,
+                    sender_username="tester",
+                    sender_is_bot=False,
+                    text="帮我记一下我的学校是上海交通大学",
+                    addressed_to_self=True,
+                    owner_user_id=20,
+                )
+                platform = RecordingPlatformTools()
+                await agent.handle_event(event, platform)
+                self.assertTrue(platform.finished)
+                self.assertIn("send_telegram_message", [name for name, _ in platform.calls])
+                notes = await storage.search_notes(10, "学校")
+                self.assertEqual(notes[0]["content"], "上海交通大学")
+            finally:
+                await registry.close()
+
+
+class FakeFunction:
+    def __init__(self, name: str, arguments: dict) -> None:
+        self.name = name
+        self.arguments = json.dumps(arguments, ensure_ascii=False)
+
+
+class FakeToolCall:
+    def __init__(self, call_id: str, name: str, arguments: dict) -> None:
+        self.id = call_id
+        self.type = "function"
+        self.function = FakeFunction(name, arguments)
+
+
+class FakeMessage:
+    def __init__(self, tool_calls: list[FakeToolCall] | None = None, content: str = "") -> None:
+        self.tool_calls = tool_calls
+        self.content = content
+
+
+class FakeChoice:
+    def __init__(self, message: FakeMessage) -> None:
+        self.message = message
+
+
+class FakeResponse:
+    def __init__(self, message: FakeMessage) -> None:
+        self.choices = [FakeChoice(message)]
+
+
+class FakeLLM:
+    def __init__(self, tool_call_batches: list[list[FakeToolCall]]) -> None:
+        self.tool_call_batches = tool_call_batches
+
+    async def chat(self, messages, tools=None, tool_choice="auto"):
+        del messages, tools, tool_choice
+        batch = self.tool_call_batches.pop(0)
+        return FakeResponse(FakeMessage(batch))
+
+    async def summarize(self, messages, previous_summary=""):
+        del messages
+        return previous_summary
 
 
 if __name__ == "__main__":

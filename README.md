@@ -1,12 +1,45 @@
 # HeroBot
 
-一个 Telegram 个人助理 bot 模板，用 OpenAI-compatible LLM 理解自然语言，并通过本地工具管理待办、提醒和笔记。
+HeroBot 是一个运行在 Telegram 上的个人助理 Agent。Telegram 仅作为消息入口和发送通道；核心决策由 OpenAI-compatible LLM 通过 ReAct-style tool loop 完成。业务能力通过本地 MCP server 暴露，Telegram 发消息等平台能力由 Agent runtime 内置工具提供。
 
-## 安全提醒
+## Architecture
 
-你刚刚把 bot token 发在了聊天里。建议到 Telegram 的 BotFather 执行 `/revoke` 或重新生成 token，然后只把新 token 放进本地 `.env`，不要提交到 Git。
+```text
+Telegram Update
+  -> Telegram Adapter
+  -> AgentEvent
+  -> ReAct Agent Runtime
+      -> Internal Platform Tools
+         - send_telegram_message
+         - finish_task
+      -> MCP Tool Registry
+         -> herobot-mcp
+            - notes
+            - reminders
+            - contacts
+            - calendar
+            - scheduling
+            - time
+            - todos
+```
 
-## 快速开始
+关键边界：
+
+- `bot.py` 负责 Telegram 鉴权、命令入口、消息接收和 `AgentEvent` 构造。
+- `agent.py` 负责 ReAct loop、工具选择、工具 observation 回填和 `finish_task` 收束。
+- `platform.py` 提供 Telegram 平台工具，工具只能向当前 chat 发送消息。
+- `mcp_server.py` 暴露本地 MCP 业务工具，不直接访问 Telegram API。
+- `tool_registry.py` 负责启动 MCP server、读取 `tools/list`、调用 `tools/call`，并注入隐藏上下文。
+
+## Requirements
+
+- Python 3.12+
+- pyenv / pyenv-virtualenv
+- Telegram BotFather 创建的 bot token
+- OpenAI-compatible LLM API
+- SQLite
+
+## Installation
 
 ```bash
 pyenv virtualenv 3.12.9 herobot
@@ -15,105 +48,145 @@ pip install -e .
 cp .env.example .env
 ```
 
+安装后会注册三个命令：
+
+```text
+herobot       # 启动单个 Telegram bot 实例
+herobot-multi # 从 instances/*.env 批量启动多个实例
+herobot-mcp   # 本地 MCP business tool server
+```
+
+通常只需要运行 `herobot` 或 `herobot-multi`。主进程会按配置自动启动 `herobot-mcp`。
+
+## Configuration
+
 编辑 `.env`：
 
 ```bash
-TELEGRAM_BOT_TOKEN=你的新token
+TELEGRAM_BOT_TOKEN=replace-with-your-token
 TELEGRAM_ENABLE_USER_WHITELIST=true
-TELEGRAM_ALLOWED_USER_IDS=你的Telegram用户ID
-OPENAI_API_KEY=你的LLM API key
+TELEGRAM_ALLOWED_USER_IDS=123456789
+
+OPENAI_API_KEY=replace-with-your-api-key
 OPENAI_BASE_URL=localhost:4000
-OPENAI_MODEL=你的模型名
+OPENAI_MODEL=your-model
+
 HEROBOT_DB_PATH=data/herobot.sqlite3
-HEROBOT_OWNER_NAME=你的名字
+HEROBOT_PERSONA=
 HEROBOT_DEFAULT_TIMEZONE=Asia/Shanghai
-HEROBOT_WORKING_HOURS=09:00-18:00
-HEROBOT_DEFAULT_REMINDER_MINUTES=10
+HEROBOT_MAX_AGENT_STEPS=8
+HEROBOT_MCP_SERVER_COMMAND=herobot-mcp
+
 ENABLE_BOT_TO_BOT=false
 TELEGRAM_ALLOWED_BOT_USERNAMES=other_bot,review_bot
-BOT_TO_BOT_MAX_DEPTH=3
+
+LOG_LEVEL=INFO
 ```
 
-如果不知道自己的 Telegram 用户 ID，先启动 bot 后发送 `/whoami`，再把返回的 ID 写入 `.env` 的 `TELEGRAM_ALLOWED_USER_IDS`。
+配置说明：
 
-群聊测试时可以临时关闭白名单：
+- `TELEGRAM_ALLOWED_USER_IDS`：允许使用个人助理的 Telegram user id。可先启动 bot 后发送 `/whoami` 获取。
+- `OPENAI_BASE_URL`：支持 OpenAI-compatible API，例如 `localhost:4000`。
+- `HEROBOT_DB_PATH`：本地 SQLite 数据库路径。
+- `HEROBOT_MAX_AGENT_STEPS`：Agent 单轮最大工具步数，是防止循环的保险丝。
+- `HEROBOT_MCP_SERVER_COMMAND`：本地 MCP server 启动命令，默认 `herobot-mcp`。
+- `ENABLE_BOT_TO_BOT`：是否允许白名单内其他 bot 的消息进入 Agent runtime。
+- `TELEGRAM_ALLOWED_BOT_USERNAMES`：允许交互的 bot username，逗号分隔，不需要 `@`。
+
+测试群聊时可以临时关闭用户白名单：
 
 ```bash
 TELEGRAM_ENABLE_USER_WHITELIST=false
 ```
 
-关闭后任何能 @ 到 bot 的人都能消耗你的 LLM API 额度，测试完建议改回 `true`。
+关闭后，任何能在群聊中 @ 到 bot 的用户都可能消耗 LLM API 额度。测试结束后建议重新开启。
 
-启动 bot：
+## Running
+
+启动单个实例：
 
 ```bash
 herobot
 ```
 
-然后在 Telegram 里打开你的 bot，发送 `/start`。
-
-## 批量启动多个 bot
-
-不要复制整个项目来启动多个实例。推荐一个代码目录配多个 env 文件：
+指定 env 文件：
 
 ```bash
-cp instances/super666666.env.example instances/super666666.env
-cp instances/other.env.example instances/other.env
+herobot --env-file instances/super666666.env
 ```
 
-分别填写不同的 `TELEGRAM_BOT_TOKEN`，并给每个实例设置不同的 `HEROBOT_DB_PATH`。
-
-启动全部实例：
+批量启动多个实例：
 
 ```bash
 herobot-multi --env-dir instances
 ```
 
-也可以单独启动某个实例：
+同一个 Telegram bot token 只能有一个 polling 进程。如果看到 `409 Conflict`，说明同一个 token 被多个进程同时使用。
 
-```bash
-herobot --env-file instances/super666666.env
-herobot --env-file instances/other.env
-```
+## Capabilities
 
-同一个 Telegram bot token 只能有一个 polling 进程。如果看到 `409 Conflict`，基本就是某个 token 被两个进程同时使用了。
+HeroBot 当前支持：
 
-## 当前能力
+- 自然语言待办：创建、查询、完成待办。
+- 自然语言提醒：创建提醒、查询提醒。
+- 个人笔记：保存和搜索笔记。
+- 联系人：维护“姓名 + bot username”的通讯录。
+- 本地日程：创建事件、查询事件、计算空闲时间。
+- 助理间约时间：在共同群聊中联系另一个助理 bot，只交换可用时间，不暴露具体日程内容。
+- 通用 bot-to-bot 协作：Agent 可按意图通过 `send_telegram_message` 自然联系其他 bot。
 
-- `/start`：开始会话
-- `/help`：查看命令
-- `/reset`：清空当前聊天的对话上下文，不删除待办、提醒、笔记
-- `/whoami`：查看自己的 Telegram user id
-- `/chatid`：查看当前 chat id 和 chat type
-- `/contacts`：查看联系人通讯录
-- `/calendar`：查看未来 7 天日程
-- `/availability`：查看默认时间范围的空闲时间
-- `/pending`：查看待确认的约时间
-- 自然语言创建和查询待办，例如“我今天要买牛奶”“我还有什么待办？”
-- 自然语言创建和查询提醒，例如“提醒我 20 分钟后喝水”
-- 自然语言保存和搜索笔记，例如“帮我记一下护照放在抽屉里”
-- 自然语言维护联系人和日程，例如“添加联系人 李雷 @lilei_bot”“明天 14:00-16:00 有会”
-- 群聊中跨助理约时间，例如“@super666666_bot 帮我和李雷约明天下午 30 分钟”
-- 计算和当前时间工具，由 LLM 按需调用
-- 群聊实验功能：开启 `ENABLE_BOT_TO_BOT=true` 后，可以让 HeroBot 在群里 @ 另一个 bot 发起协作请求
-
-群聊 bot-to-bot 委托时，第一个被 @ 的 bot 是主控方，后续 @ 的 bot 是协作目标。例如：
+示例：
 
 ```text
-@super666666_bot 请你和 @HEHUAone_bot 讨论一下：先有鸡还是先有蛋？
+帮我记一下：护照放在书桌右边抽屉里
+添加联系人 李雷 @HEHUAone_bot
+我明天 14:00-16:00 要和 mentor 开会
+@super666666_bot 帮我和李雷约明天下午 30 分钟
+@super666666_bot 帮我问问 @HEHUAone_bot 能做啥
 ```
 
-这条消息只会由 `@super666666_bot` 发起委托，`@HEHUAone_bot` 会等待协议消息，不会同时抢着发起。
+## Telegram Commands
 
-## 项目结构
+- `/start`：启动说明。
+- `/help`：查看帮助。
+- `/reset`：清空当前 chat 的对话上下文，不删除笔记、提醒、联系人或日程。
+- `/whoami`：查看当前 Telegram user id。
+- `/chatid`：查看当前 chat id 和 chat type。
+- `/contacts`：交给 Agent 查询联系人。
+- `/calendar` / `/calender`：交给 Agent 查询近期日程。
+- `/availability`：交给 Agent 查询空闲时间。
+- `/pending`：交给 Agent 查询待确认的约时间。
+
+## Development
+
+常用检查：
+
+```bash
+python -m compileall src tests
+python -m unittest discover -s tests
+```
+
+项目结构：
 
 ```text
 src/herobot/
-  agent.py      # LLM 编排层，负责上下文、工具调用和最终回复
-  bot.py        # Telegram 适配层，负责鉴权、收消息、发消息、命令注册
-  bot2bot.py    # 群聊 bot-to-bot 委托消息格式和解析
-  llm.py        # OpenAI-compatible LLM 客户端
-  scheduler.py  # 进程内提醒调度
-  storage.py    # SQLite 持久化
-  tools.py      # 待办、提醒、笔记、时间、计算工具
+  agent.py         ReAct-style Agent runtime
+  bot.py           Telegram adapter
+  platform.py      Telegram platform tools
+  mcp_server.py    Local MCP business tool server
+  tool_registry.py MCP client/registry
+  tools.py         Business tool implementations
+  storage.py       SQLite persistence
+  scheduling.py    Deterministic availability/time-window helpers
+  scheduler.py     Reminder delivery loop
+  llm.py           OpenAI-compatible LLM client
+  multi.py         Multi-instance launcher
+  bot2bot.py       Telegram username/mention helpers
 ```
+
+## Security Notes
+
+- 不要提交 `.env`、`instances/*.env`、SQLite 数据库或任何真实 token。
+- 如果 bot token 曾经暴露，应在 BotFather 中重新生成。
+- bot-to-bot 群聊测试建议使用 `TELEGRAM_ALLOWED_BOT_USERNAMES` 控制可交互 bot。
+- `send_telegram_message` 只能向当前 chat 发送消息，不支持任意 chat id，避免 Agent 越权发消息。

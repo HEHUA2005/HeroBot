@@ -14,9 +14,9 @@ TELEGRAM_ALLOWED_USER_IDS=你的Telegram user id
 OPENAI_BASE_URL=localhost:4000
 OPENAI_API_KEY=你的LLM API key
 HEROBOT_DB_PATH=data/herobot.sqlite3
-HEROBOT_OWNER_NAME=你的名字
 HEROBOT_DEFAULT_TIMEZONE=Asia/Shanghai
-HEROBOT_WORKING_HOURS=09:00-18:00
+HEROBOT_MAX_AGENT_STEPS=8
+HEROBOT_MCP_SERVER_COMMAND=herobot-mcp
 ENABLE_BOT_TO_BOT=false
 ```
 
@@ -40,7 +40,8 @@ instances/hehuaone.env
 ```bash
 TELEGRAM_BOT_TOKEN=不同bot token
 HEROBOT_DB_PATH=data/不同数据库.sqlite3
-HEROBOT_OWNER_NAME=不同主人名
+HEROBOT_MAX_AGENT_STEPS=8
+HEROBOT_MCP_SERVER_COMMAND=herobot-mcp
 ENABLE_BOT_TO_BOT=true
 TELEGRAM_ENABLE_USER_WHITELIST=false
 ```
@@ -289,7 +290,7 @@ bot 在指定范围内计算空闲时间。
 
 ```text
 1. 主 bot 根据通讯录找到 @HEHUAone_bot。
-2. 主 bot 在群里自然地询问对方助理的可用时间。
+2. Agent 通过 send_telegram_message 在群里自然地询问对方助理的可用时间。
 3. 对方 bot 只返回可用时间段，不暴露自己的具体日程标题、地点或原因。
 4. 主 bot 结合双方空闲时间，给主人列出 1-3 个候选。
 5. 候选不会自动写入日程，必须等主人确认。
@@ -390,8 +391,8 @@ bot 应追问缺失信息，例如时间范围或时长，而不是瞎猜。
 期望：
 
 ```text
-1. 只有第一个被 @ 的 bot 作为主控方发起。
-2. 另一个 bot 被动回应。
+1. 只有第一个被 @ 的 bot 作为主控 Agent 处理用户消息。
+2. 如果 Agent 判断需要联系另一个 bot，它会通过 send_telegram_message 自然发问。
 3. 群消息中不应出现 call_id、depth 等协议字段。
 4. 输出应尽量是纯文本，不要依赖 Markdown 表格。
 ```

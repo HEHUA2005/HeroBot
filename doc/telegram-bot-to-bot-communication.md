@@ -118,9 +118,9 @@ Bot-to-bot systems can loop. For HeroBot development, require these safeguards b
 
 - Allowlist bot usernames or bot user ids.
 - Ignore messages from unknown bots.
-- Add a call id to every outbound bot-to-bot request.
-- Keep a short-term dedupe cache of processed call ids.
-- Add a max depth or hop count.
+- Keep Telegram platform tools scoped to the current chat.
+- Require the Agent to explicitly finish each event with `finish_task`.
+- Add a max Agent step count as an execution fuse.
 - Add per-chat and per-bot rate limits.
 - Do not let another bot directly trigger privileged personal-data tools unless explicitly allowed.
 
@@ -129,34 +129,9 @@ Suggested `.env` shape:
 ```env
 ENABLE_BOT_TO_BOT=true
 TELEGRAM_ALLOWED_BOT_USERNAMES=other_bot,review_bot
-BOT_TO_BOT_MAX_DEPTH=3
+HEROBOT_MAX_AGENT_STEPS=8
 BOT_TO_BOT_RATE_LIMIT_PER_MINUTE=20
 ```
-
-Suggested message envelope for plain-text calls:
-
-```text
-[herobot-call-id: 01J...]
-[herobot-depth: 1/3]
-[herobot-from: super666666_bot]
-
-请处理这个任务：...
-```
-
-If structured payloads become necessary, prefer JSON in a fenced block:
-
-````text
-```json
-{
-  "call_id": "01J...",
-  "from_bot": "super666666_bot",
-  "depth": 1,
-  "max_depth": 3,
-  "task": "summarize",
-  "input": "..."
-}
-```
-````
 
 ## Current HeroBot Behavior
 
@@ -169,35 +144,29 @@ HeroBot currently supports group replies when addressed:
 
 Current implemented experiment:
 
-- Set `ENABLE_BOT_TO_BOT=true` to enable group bot-to-bot delegation.
+- Set `ENABLE_BOT_TO_BOT=true` to let allowed bot messages enter the Agent runtime.
 - Optionally set `TELEGRAM_ALLOWED_BOT_USERNAMES=other_bot,review_bot`; leave it empty to allow any bot during local experiments.
-- A human can ask HeroBot to involve another bot in a group, for example:
+- A human can ask HeroBot to involve another bot in a group. The Agent decides whether to call `send_telegram_message`, for example:
 
 ```text
-@super666666_bot 请你和 @other_bot 讨论一下这个数学问题：...
+@super666666_bot 帮我问问 @other_bot 能做什么
 ```
 
-- In a human group message, only the first mentioned bot should act as the coordinator. Later mentions are treated as target bots. This prevents both bots from starting mirrored calls from the same user message.
-- HeroBot sends a group message addressed to `@other_bot` with:
-  - `herobot-call-id`
-  - `herobot-purpose: request`
-  - `herobot-depth`
-  - `herobot-from`
-- Another HeroBot instance that receives the request answers with the same `call_id` and `herobot-purpose: response`.
+- In a human group message, only the first mentioned HeroBot should process the event. Later mentions are available to the Agent as possible targets.
+- HeroBot no longer emits visible `herobot-call-id`/`herobot-depth` protocol fields for ordinary bot-to-bot messages.
+- Business capabilities are exposed through the local MCP server; Telegram messaging is an internal platform tool.
 
 Current limitations:
 
-- HeroBot does not yet aggregate another bot's response into a final answer to the original human request.
-- HeroBot does not yet persist or dedupe bot-to-bot call ids.
 - HeroBot does not yet send direct private messages to another bot username.
-- HeroBot does not yet distinguish human-user tools from bot-request tools.
+- Bot-to-bot response aggregation is Agent-driven and depends on the active LLM choosing the right tools.
+- There is not yet a persisted cross-message task ledger for multi-step bot collaborations.
 
 ## Recommended Next Implementation Step
 
-Move from visible group delegation to a real request/response state machine:
+Add a persisted Agent task ledger:
 
-1. Persist outbound `call_id` records in SQLite.
-2. When a `response` message arrives, attach it to the pending call.
-3. Ask the LLM to synthesize the original user request plus the bot response.
-4. Reply to the original user thread/message with the final synthesis.
-5. Add dedupe and rate limiting before enabling fully automatic multi-hop calls.
+1. Persist outbound platform messages and their originating user request.
+2. When a bot reply arrives, attach it to the pending task.
+3. Give the Agent the pending task context explicitly.
+4. Add dedupe and rate limiting before enabling fully automatic multi-hop calls.
