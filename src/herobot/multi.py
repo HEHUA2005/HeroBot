@@ -29,6 +29,11 @@ def main() -> None:
         action="store_true",
         help="List matching env files and exit without starting processes.",
     )
+    parser.add_argument(
+        "--config-dir",
+        default="instances",
+        help="Directory containing optional per-instance TOML config files.",
+    )
     args = parser.parse_args()
 
     env_dir = Path(args.env_dir)
@@ -46,8 +51,12 @@ def main() -> None:
             name = env_file.stem
             env = os.environ.copy()
             env["HEROBOT_INSTANCE_NAME"] = name
+            command = [sys.executable, "-m", "herobot.bot", "--env-file", str(env_file)]
+            config_file = Path(args.config_dir) / f"{name}.toml"
+            if config_file.exists():
+                command.extend(["--config", str(config_file)])
             process = subprocess.Popen(
-                [sys.executable, "-m", "herobot.bot", "--env-file", str(env_file)],
+                command,
                 env=env,
                 text=True,
             )

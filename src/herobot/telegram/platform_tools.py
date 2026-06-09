@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from herobot.agent import AgentEvent
-from herobot.storage import Storage, dumps_result
+from herobot.core.conversation_store import ConversationStore, dumps_result
 
 
 PLATFORM_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -25,6 +26,30 @@ PLATFORM_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "reply_to_message_id": {"type": "integer"},
                 },
                 "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_telegram_messages",
+            "description": (
+                "Send multiple messages sequentially in the current Telegram chat. "
+                "Use this when the user explicitly asks for separate consecutive messages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "messages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                    },
+                    "target_username": {"type": "string"},
+                },
+                "required": ["messages"],
                 "additionalProperties": False,
             },
         },
@@ -53,7 +78,7 @@ class TelegramPlatformTools:
     def __init__(
         self,
         telegram_context: ContextTypes.DEFAULT_TYPE,
-        storage: Storage,
+        storage: ConversationStore,
         event: AgentEvent,
     ) -> None:
         self.telegram_context = telegram_context
@@ -66,11 +91,13 @@ class TelegramPlatformTools:
         return PLATFORM_TOOL_SCHEMAS
 
     def can_handle(self, name: str) -> bool:
-        return name in {"send_telegram_message", "finish_task"}
+        return name in {"send_telegram_message", "send_telegram_messages", "finish_task"}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         if name == "send_telegram_message":
             return await self._send_telegram_message(arguments)
+        if name == "send_telegram_messages":
+            return await self._send_telegram_messages(arguments)
         if name == "finish_task":
             self.finished = True
             self.finish_payload = {
@@ -80,6 +107,28 @@ class TelegramPlatformTools:
             }
             return dumps_result({"ok": True, "result": self.finish_payload})
         return dumps_result({"ok": False, "error": f"unknown platform tool: {name}"})
+
+    async def _send_telegram_messages(self, arguments: dict[str, Any]) -> str:
+        raw_messages = arguments.get("messages")
+        if not isinstance(raw_messages, list) or not raw_messages:
+            return dumps_result({"ok": False, "error": "messages must be a non-empty list"})
+        target_username = str(arguments.get("target_username") or "").strip().lstrip("@")
+        sent_messages: list[dict[str, Any]] = []
+        for item in raw_messages[:20]:
+            text = str(item).strip()
+            if not text:
+                continue
+            result = json.loads(
+                await self._send_telegram_message(
+                    {"text": text, "target_username": target_username}
+                    if target_username
+                    else {"text": text}
+                )
+            )
+            if not result.get("ok"):
+                return dumps_result(result)
+            sent_messages.append(result["result"])
+        return dumps_result({"ok": True, "result": sent_messages})
 
     async def _send_telegram_message(self, arguments: dict[str, Any]) -> str:
         text = str(arguments.get("text", "")).strip()
@@ -95,11 +144,22 @@ class TelegramPlatformTools:
         if reply_to_message_id is not None:
             reply_to_message_id = int(reply_to_message_id)
 
-        sent = await self.telegram_context.bot.send_message(
-            chat_id=self.event.chat_id,
-            text=outbound_text,
-            reply_to_message_id=reply_to_message_id,
-        )
+        send_kwargs: dict[str, Any] = {
+            "chat_id": self.event.chat_id,
+            "text": outbound_text,
+        }
+        if reply_to_message_id is not None:
+            send_kwargs["reply_to_message_id"] = reply_to_message_id
+        if self.event.message_thread_id is not None:
+            send_kwargs["message_thread_id"] = self.event.message_thread_id
+
+        try:
+            sent = await self.telegram_context.bot.send_message(**send_kwargs)
+        except BadRequest as exc:
+            if reply_to_message_id is None or "message to be replied not found" not in str(exc).lower():
+                raise
+            send_kwargs.pop("reply_to_message_id", None)
+            sent = await self.telegram_context.bot.send_message(**send_kwargs)
         await self.storage.add_message(self.event.chat_id, "assistant", outbound_text)
         return dumps_result(
             {
@@ -130,10 +190,22 @@ class RecordingPlatformTools:
         return PLATFORM_TOOL_SCHEMAS
 
     def can_handle(self, name: str) -> bool:
-        return name in {"send_telegram_message", "finish_task"}
+        return name in {"send_telegram_message", "send_telegram_messages", "finish_task"}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         self.calls.append((name, arguments))
         if name == "finish_task":
             self.finished = True
+        if name == "send_telegram_messages":
+            return json.dumps(
+                {
+                    "ok": True,
+                    "result": [
+                        {"text": str(item)}
+                        for item in arguments.get("messages", [])
+                        if str(item).strip()
+                    ],
+                },
+                ensure_ascii=False,
+            )
         return json.dumps({"ok": True, "result": arguments}, ensure_ascii=False)

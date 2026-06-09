@@ -14,7 +14,8 @@ dependencies = [
 [project.scripts]
 herobot = "herobot.bot:main"
 herobot-multi = "herobot.multi:main"
-herobot-mcp = "herobot.mcp_server:main"
+herobot-mcp-notes = "herobot.mcp.builtin.notes.server:main"
+herobot-mcp-calendar = "herobot.mcp.builtin.calendar.server:main"
 
 [build-system]
 requires = ["hatchling"]

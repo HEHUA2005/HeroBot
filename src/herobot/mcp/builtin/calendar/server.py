@@ -5,32 +5,37 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from herobot.storage import Storage
-from herobot.tools import BusinessTools, ToolContext, context_from_payload
+from herobot.mcp.builtin.calendar.storage import CalendarStorage
+from herobot.mcp.builtin.calendar.tools import CalendarTools
+from herobot.mcp.context import HIDDEN_CONTEXT_KEY, ToolContext, context_from_payload
 
 
 mcp = FastMCP(
-    "herobot-business-tools",
+    "herobot-calendar-tools",
     instructions=(
-        "Business tools for HeroBot personal assistant data: notes, reminders, "
-        "contacts, calendar, availability, and scheduling sessions."
+        "Calendar, contacts, reminders, availability, and scheduling tools for HeroBot. "
+        "Does not access Telegram directly."
     ),
 )
 
-_business_tools: BusinessTools | None = None
+_tools: CalendarTools | None = None
 _initialized = False
 
 
-async def business_tools() -> BusinessTools:
-    global _business_tools, _initialized
-    if _business_tools is None:
+async def calendar_tools() -> CalendarTools:
+    global _tools, _initialized
+    if _tools is None:
         timezone_name = os.getenv("HEROBOT_DEFAULT_TIMEZONE", "Asia/Shanghai")
-        storage = Storage(os.getenv("HEROBOT_DB_PATH", "data/herobot.sqlite3"))
-        _business_tools = BusinessTools(storage, timezone_name=timezone_name)
+        db_path = (
+            os.getenv("HEROBOT_CALENDAR_DB_PATH")
+            or os.getenv("HEROBOT_DB_PATH")
+            or "data/herobot-calendar.sqlite3"
+        )
+        _tools = CalendarTools(CalendarStorage(db_path), timezone_name=timezone_name)
     if not _initialized:
-        await _business_tools.storage.init()
+        await _tools.storage.init()
         _initialized = True
-    return _business_tools
+    return _tools
 
 
 def context(payload: dict[str, Any] | None) -> ToolContext:
@@ -40,39 +45,8 @@ def context(payload: dict[str, Any] | None) -> ToolContext:
 async def invoke(
     name: str, arguments: dict[str, Any], herobot_context: dict[str, Any] | None
 ) -> dict[str, Any]:
-    tools = await business_tools()
-    return await tools.invoke(name, arguments, context({ "herobot_context": herobot_context or {} }))
-
-
-@mcp.tool(description="Create a personal todo item.")
-async def create_todo(title: str, herobot_context: dict[str, Any] | None = None) -> dict[str, Any]:
-    return await invoke("create_todo", {"title": title}, herobot_context)
-
-
-@mcp.tool(description="List personal todo items.")
-async def list_todos(
-    status: str = "open", herobot_context: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return await invoke("list_todos", {"status": status}, herobot_context)
-
-
-@mcp.tool(description="Mark a todo as done by id.")
-async def complete_todo(
-    todo_id: int, herobot_context: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return await invoke("complete_todo", {"todo_id": todo_id}, herobot_context)
-
-
-@mcp.tool(description="Create a personal note.")
-async def create_note(
-    title: str, content: str, herobot_context: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return await invoke("create_note", {"title": title, "content": content}, herobot_context)
-
-
-@mcp.tool(description="Search personal notes by keyword.")
-async def search_notes(query: str, herobot_context: dict[str, Any] | None = None) -> dict[str, Any]:
-    return await invoke("search_notes", {"query": query}, herobot_context)
+    tools = await calendar_tools()
+    return await tools.invoke(name, arguments, context({HIDDEN_CONTEXT_KEY: herobot_context or {}}))
 
 
 @mcp.tool(description="Create a Telegram reminder. remind_at must be ISO 8601 with timezone.")
@@ -93,6 +67,20 @@ async def list_reminders(
     include_sent: bool = False, herobot_context: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     return await invoke("list_reminders", {"include_sent": include_sent}, herobot_context)
+
+
+@mcp.tool(description="List due reminders for the runtime scheduler. Hidden from the LLM.")
+async def list_due_reminders(
+    now_iso: str, herobot_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return await invoke("list_due_reminders", {"now_iso": now_iso}, herobot_context)
+
+
+@mcp.tool(description="Mark a reminder as sent for the runtime scheduler. Hidden from the LLM.")
+async def mark_reminder_sent(
+    reminder_id: int, herobot_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return await invoke("mark_reminder_sent", {"reminder_id": reminder_id}, herobot_context)
 
 
 @mcp.tool(description="Get the current date and time.")

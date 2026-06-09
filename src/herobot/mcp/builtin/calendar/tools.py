@@ -1,39 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from herobot.scheduling import TimeWindow, find_free_windows, from_iso, intersect_windows, to_utc_iso
-from herobot.storage import Storage
-
-
-HIDDEN_CONTEXT_KEY = "herobot_context"
-
-
-@dataclass(frozen=True)
-class ToolContext:
-    chat_id: int
-    user_id: int
-    chat_type: str = "private"
-    timezone: str = "Asia/Shanghai"
-    owner_user_id: int | None = None
-
-    @property
-    def effective_owner_user_id(self) -> int:
-        return self.owner_user_id if self.owner_user_id is not None else self.user_id
-
-
-def context_from_payload(payload: dict[str, Any], default_timezone: str = "Asia/Shanghai") -> ToolContext:
-    raw = payload.get(HIDDEN_CONTEXT_KEY) or {}
-    return ToolContext(
-        chat_id=int(raw.get("chat_id", 0)),
-        user_id=int(raw.get("user_id", 0)),
-        chat_type=str(raw.get("chat_type", "private")),
-        timezone=str(raw.get("timezone") or default_timezone),
-        owner_user_id=int(raw["owner_user_id"]) if raw.get("owner_user_id") is not None else None,
-    )
+from herobot.mcp.builtin.calendar.scheduling import (
+    TimeWindow,
+    find_free_windows,
+    from_iso,
+    intersect_windows,
+    to_utc_iso,
+)
+from herobot.mcp.builtin.calendar.storage import CalendarStorage
+from herobot.mcp.context import ToolContext
 
 
 def ok_result(result: Any) -> dict[str, Any]:
@@ -44,8 +23,8 @@ def error_result(error: Exception | str) -> dict[str, Any]:
     return {"ok": False, "error": str(error)}
 
 
-class BusinessTools:
-    def __init__(self, storage: Storage, timezone_name: str = "Asia/Shanghai") -> None:
+class CalendarTools:
+    def __init__(self, storage: CalendarStorage, timezone_name: str = "Asia/Shanghai") -> None:
         self.storage = storage
         self.timezone = timezone_name
 
@@ -59,30 +38,17 @@ class BusinessTools:
             return error_result(exc)
 
     async def _invoke(self, name: str, arguments: dict[str, Any], context: ToolContext) -> Any:
-        if name == "create_todo":
-            return await self.storage.create_todo(
-                context.chat_id, context.user_id, arguments["title"].strip()
-            )
-        if name == "list_todos":
-            return await self.storage.list_todos(context.chat_id, arguments.get("status", "open"))
-        if name == "complete_todo":
-            return await self.storage.complete_todo(context.chat_id, int(arguments["todo_id"]))
         if name == "create_reminder":
             return await self.create_reminder(arguments, context)
         if name == "list_reminders":
             return await self.storage.list_reminders(
                 context.chat_id, bool(arguments.get("include_sent", False))
             )
-        if name == "create_note":
-            return await self.storage.create_note(
-                context.chat_id,
-                context.user_id,
-                arguments["title"].strip(),
-                arguments["content"].strip(),
-            )
-        if name == "search_notes":
-            query = arguments["query"].strip()
-            return await self.storage.search_notes_by_terms(context.chat_id, [query])
+        if name == "list_due_reminders":
+            reminders = await self.storage.due_reminders(arguments["now_iso"])
+            return [reminder.__dict__ for reminder in reminders]
+        if name == "mark_reminder_sent":
+            return await self.storage.mark_reminder_sent(int(arguments["reminder_id"]))
         if name == "get_current_time":
             now = datetime.now(ZoneInfo(context.timezone or self.timezone))
             return {"iso": now.isoformat(), "display": now.strftime("%Y-%m-%d %H:%M:%S %Z")}
@@ -110,7 +76,7 @@ class BusinessTools:
             return await self.confirm_scheduling_candidate(arguments, context)
         if name == "cancel_scheduling_request":
             return await self.cancel_scheduling_request(arguments, context)
-        raise ValueError(f"unknown tool: {name}")
+        raise ValueError(f"unknown calendar tool: {name}")
 
     async def create_reminder(
         self, arguments: dict[str, Any], context: ToolContext

@@ -1,0 +1,47 @@
+[core]
+timezone = "Asia/Shanghai"
+core_db_path = "data/herobot-core.sqlite3"
+max_agent_steps = 8
+reminder_interval_seconds = 30
+
+[telegram]
+user_whitelist_enabled = true
+bot_to_bot_enabled = true
+
+[commands.aliases]
+calendar = "查看未来 7 天日程"
+calender = "查看未来 7 天日程"
+contacts = "查看联系人通讯录"
+availability = "查看近期空闲时间"
+pending = "查看待确认的约时间"
+
+[[mcp.servers]]
+name = "notes"
+command = "herobot-mcp-notes"
+args = []
+enabled = true
+required = true
+exposed_tools = []
+hidden_tools = []
+env = { HEROBOT_NOTES_DB_PATH = "data/herobot-notes.sqlite3" }
+
+[[mcp.servers]]
+name = "calendar"
+command = "herobot-mcp-calendar"
+args = []
+enabled = true
+required = true
+exposed_tools = []
+hidden_tools = ["list_due_reminders", "mark_reminder_sent"]
+env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
+
+# External MCP server example:
+#
+# [[mcp.servers]]
+# name = "weather"
+# command = "python"
+# args = ["-m", "my_weather_mcp"]
+# enabled = true
+# required = false
+# exposed_tools = []
+# hidden_tools = []

@@ -1,0 +1,1 @@
+"""Notes/todos MCP server."""

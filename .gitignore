@@ -1,4 +1,5 @@
 .env
+herobot.toml
 .venv/
 __pycache__/
 *.py[cod]

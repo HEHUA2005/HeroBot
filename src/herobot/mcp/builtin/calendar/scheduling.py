@@ -92,13 +92,13 @@ def find_free_windows(
     duration_minutes: int,
     limit: int = 3,
 ) -> list[TimeWindow]:
-    busy = sorted(
-        (
+    busy = merge_windows(
+        [
             TimeWindow(from_iso(event["start_at"]), from_iso(event["end_at"]))
             for event in events
-            if event["status"] != "cancelled" and event_overlaps(event, window.start, window.end)
-        ),
-        key=lambda item: item.start,
+            if event["status"] != "cancelled"
+            and event_overlaps(event, window.start, window.end)
+        ]
     )
     cursor = window.start
     slots: list[TimeWindow] = []
@@ -116,16 +116,33 @@ def find_free_windows(
 
 
 def intersect_windows(
-    left: list[TimeWindow], right: list[TimeWindow], duration_minutes: int, limit: int = 3
+    left: list[TimeWindow],
+    right: list[TimeWindow],
+    duration_minutes: int,
+    limit: int = 3,
 ) -> list[TimeWindow]:
     duration = timedelta(minutes=duration_minutes)
     candidates: list[TimeWindow] = []
-    for a in left:
-        for b in right:
+    for a in merge_windows(left):
+        for b in merge_windows(right):
             start = max(a.start, b.start)
             end = min(a.end, b.end)
             if end - start >= duration:
-                candidates.append(TimeWindow(start, start + duration))
-                if len(candidates) >= limit:
-                    return candidates
-    return candidates
+                candidates.append(TimeWindow(start, end))
+    return [
+        TimeWindow(item.start, item.start + duration)
+        for item in merge_windows(candidates)
+        if item.end - item.start >= duration
+    ][:limit]
+
+
+def merge_windows(windows: list[TimeWindow]) -> list[TimeWindow]:
+    merged: list[TimeWindow] = []
+    for item in sorted(windows, key=lambda candidate: candidate.start):
+        if item.end <= item.start:
+            continue
+        if not merged or item.start > merged[-1].end:
+            merged.append(item)
+            continue
+        merged[-1] = TimeWindow(merged[-1].start, max(merged[-1].end, item.end))
+    return merged
