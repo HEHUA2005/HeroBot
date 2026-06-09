@@ -36,7 +36,7 @@ from herobot.mcp.builtin.notes.storage import NotesStorage
 from herobot.mcp.builtin.notes.tools import NotesTools
 from herobot.mcp.config import MCPServerConfig
 from herobot.mcp.context import ToolContext
-from herobot.mcp.registry import MCPToolRegistry
+from herobot.mcp.registry import MCPToolRegistry, _MCPServerConnection
 from herobot.agent import Agent, AgentEvent
 from herobot.agent.task import (
     ActionLedger,
@@ -486,6 +486,20 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("create_note", {item["function"]["name"] for item in schemas})
             finally:
                 await registry.close()
+
+    def test_builtin_mcp_command_resolution_uses_child_env_path(self) -> None:
+        connection = _MCPServerConnection(
+            MCPServerConfig(
+                name="notes",
+                command="herobot-mcp-notes",
+                args=["--example"],
+            )
+        )
+
+        command, args = connection._resolved_command({"PATH": ""})
+
+        self.assertEqual(command, sys.executable)
+        self.assertEqual(args, ["-m", "herobot.mcp.builtin.notes.server", "--example"])
 
     async def test_agent_runtime_uses_mcp_and_finish_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

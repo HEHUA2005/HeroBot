@@ -47,7 +47,7 @@ class _MCPServerConnection:
         stack = AsyncExitStack()
         env = os.environ.copy()
         env.update(self.config.env)
-        command, args = self._resolved_command()
+        command, args = self._resolved_command(env)
         params = StdioServerParameters(
             command=command,
             args=args,
@@ -74,9 +74,9 @@ class _MCPServerConnection:
             raise RuntimeError(f"MCP server is not started: {self.config.name}")
         return await self._session.call_tool(name, payload)
 
-    def _resolved_command(self) -> tuple[str, list[str]]:
+    def _resolved_command(self, env: dict[str, str]) -> tuple[str, list[str]]:
         module = BUILTIN_COMMAND_MODULES.get(self.config.command)
-        if module is None or shutil.which(self.config.command):
+        if module is None or shutil.which(self.config.command, path=env.get("PATH")):
             return self.config.command, self.config.args
         return sys.executable, ["-m", module, *self.config.args]
 
