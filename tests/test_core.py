@@ -25,6 +25,27 @@ from herobot.platform import RecordingPlatformTools
 from herobot.scheduling import TimeWindow, find_free_windows, intersect_windows, parse_iso_text_window, to_utc_iso
 
 
+# REVIEW: 测试总体还可以，但有几个问题值得改进：
+#
+# 1. 所有测试放在一个类里，没有按模块拆分。建议拆成 TestStorage、TestTools、
+#    TestAgent、TestScheduling 等。
+#
+# 2. 缺少负面测试（unhappy path）：
+#    - 创建空标题的 todo 会怎样？
+#    - 删除不存在的联系人会怎样？
+#    - LLM 返回无法解析的 JSON 会怎样？
+#    - MCP server 启动失败会怎样？
+#    用户总是会做出意想不到的事情，你的测试应该覆盖这些场景。
+#
+# 3. test_agent_runtime_uses_mcp_and_finish_task 用 FakeLLM 硬编码了
+#    工具调用序列，这测试的是"agent 能正确执行预设的步骤"，
+#    而不是"agent 能正确理解用户意图"。虽然后者很难测，
+#    但至少应该测试一些边界情况，比如 LLM 返回未知工具名。
+#
+# 4. 没有性能测试——往数据库插入 1000 条笔记后搜索还快吗？
+#
+# 5. 建议用 pytest 而不是 unittest——pytest 语法更简洁、fixture 更灵活、
+#    输出更友好。
 class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_parse_allowed_user_ids(self) -> None:
         self.assertEqual(parse_allowed_user_ids("1, 2,3"), {1, 2, 3})

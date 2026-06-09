@@ -45,6 +45,13 @@ MAX_RELATED_NOTES = 5
 SUMMARY_THRESHOLD = 24
 
 
+# REVIEW: 硬编码的中文停用词列表，问题很多：
+# 1. 维护成本高——用户换一种说法就可能绕过（"找一下"、"看看"、"告诉我"都没覆盖）
+# 2. 替换逻辑是字符串 replace，不是按词边界切分。"什么" 会把 "为什么东西" 变成 "为东西"
+# 3. 只考虑了中文，英文、中英混合的消息处理不了
+# 4. 更根本的问题：这个 note_search_terms 函数试图自己做 NLP 提取关键词，
+#    但你已经在用 LLM 了！为什么不让 LLM 来提取搜索关键词？
+#    或者至少用 jieba 分词 + 停用词表，比手写 replace 可靠得多。
 NOTE_STOP_PHRASES = (
     "在哪里",
     "在哪",
@@ -181,6 +188,19 @@ class Agent:
         tool_context = event.tool_context()
         tools = self.tool_registry.openai_tool_schemas() + platform_tools.openai_tool_schemas()
 
+        # REVIEW: LLM 调用没有任何重试机制。OpenAI API（或兼容 API）经常出现：
+        # - 429 Rate Limit（限速）
+        # - 500/502/503 临时故障
+        # - 网络超时
+        # 任何一种都会直接让整个 handle_event 异常，用户看到 "Agent 执行失败" 的原始报错。
+        # 建议：
+        # 1. 在 llm.chat() 中加指数退避重试（tenacity 库或手写）
+        # 2. 对用户暴露友好的错误信息而非 Python 异常
+        # 3. 考虑设置 timeout，避免 LLM 卡住导致整个 bot 不响应
+        #
+        # 另一个问题：整个 agent loop 没有总超时。如果 LLM 每步都很慢（比如每次 10 秒），
+        # 8 步就是 80 秒，加上 tool 调用时间可能超过 2 分钟。用户会认为 bot 挂了。
+        # Telegram 的 typing 指示器只在开头发了一次，之后就没了。
         for step in range(self.max_steps):
             response = await self.llm.chat(messages, tools=tools)
             assistant_message = response.choices[0].message
@@ -284,6 +304,13 @@ class Agent:
             },
         )
 
+    # REVIEW: _maybe_summarize 的触发条件是 count % SUMMARY_THRESHOLD == 0。
+    # 这意味着恰好在第 24、48、72... 条消息时才触发。如果因为异常或并发导致
+    # 消息数跳过了 24 的整数倍（比如从 23 直接到 25），就永远不会触发摘要。
+    # 更稳健的做法是记录"上次摘要时的消息数"，当差值超过阈值时触发。
+    #
+    # 另外 except Exception: return 吞掉了所有异常——包括 LLM 返回格式错误、
+    # 存储写入失败等。至少应该 log 一下，否则摘要一直不更新你都不知道为什么。
     async def _maybe_summarize(self, chat_id: int) -> None:
         count = await self.storage.message_count(chat_id)
         if count < SUMMARY_THRESHOLD or count % SUMMARY_THRESHOLD != 0:

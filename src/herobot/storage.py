@@ -22,6 +22,14 @@ class Reminder:
     remind_at: str
 
 
+# REVIEW: Storage 层最大的问题：每个方法都 aiosqlite.connect() 开一个新连接。
+# 对于一次用户请求，agent 可能连续调用 5-10 次 storage 方法，每次都走 connect/close，
+# 这在生产环境下是严重的性能浪费。应该维护一个持久连接或连接池。
+# 推荐方案：在 init() 时创建连接，保存为 self._db，所有方法复用同一个连接。
+# aiosqlite 本身是单连接的，如果需要并发可以考虑用 aiosqlite 连接池或 databases 库。
+#
+# 另一个架构问题：没有数据库迁移策略。当前用 CREATE TABLE IF NOT EXISTS 建表，
+# 未来加字段、改字段类型都会很痛苦。建议引入 alembic 或至少维护一个 schema_version 表。
 class Storage:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -143,6 +151,13 @@ class Storage:
             )
             await db.commit()
 
+    # REVIEW: 对话历史只保留最近 12 条消息（默认 limit=12），但是一次 agent 交互
+    # 可能产生多条 user/assistant 消息。如果用户连续对话，上下文会很快丢失。
+    # 并且这里只返回 role in {"user", "assistant"} 的消息，agent 的 tool 调用记录
+    # 完全不保存，这意味着：
+    # 1. 无法做事后调试（用户反馈"bot 刚才做错了"，你没法查日志）
+    # 2. agent 重新进入时没有之前的 tool 调用上下文
+    # 建议至少保存 tool_calls 和 tool 结果到一个 agent_logs 表。
     async def recent_messages(self, chat_id: int, limit: int = 12) -> list[dict[str, str]]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -215,6 +230,14 @@ class Storage:
             rows = await db.execute_fetchall(query, params)
         return [dict(row) for row in rows]
 
+    # REVIEW: complete_todo 的返回值混用了两种模式——有时返回 {"ok": False, "error": ...}，
+    # 有时返回 {"ok": True, "id": ...}。但调用方 tools.py 的 invoke() 会再包一层 ok_result()，
+    # 导致成功时变成 {"ok": True, "result": {"ok": True, ...}}，双重嵌套。
+    # 建议统一：storage 层只返回数据或抛异常，ok/error 包装统一在 tools 层做。
+    #
+    # 另外从用户角度：complete_todo 没有检查 rowcount，如果 UPDATE 没有命中任何行
+    #（比如 todo 已经是 done），用户看到的是 status='done' 但不知道其实啥也没变。
+    # 用户会困惑"我完成了吗？还是之前就完成了？"
     async def complete_todo(self, chat_id: int, todo_id: int) -> dict[str, Any]:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
@@ -318,6 +341,15 @@ class Storage:
             )
         return [dict(row) for row in rows]
 
+    # REVIEW: search_notes_by_terms 用 LIKE '%term%' 做全表扫描搜索。
+    # 数据量小的时候没问题，但笔记多了之后会越来越慢。
+    # SQLite 支持 FTS5 全文搜索扩展，性能和相关性排序都会好很多，
+    # 而且对中文可以配合简单分词。建议后续引入 FTS5。
+    #
+    # 另外从用户视角想一下：用户搜"护照在哪"时，搜索词经过 note_search_terms 过滤后
+    # 可能只剩"护照"。但如果用户存的笔记标题是"证件位置"，内容是"护照放在抽屉里"，
+    # 这样能搜到。但如果用户搜"我的证件"，就搜不到了，因为"证件"和"护照"没有语义关联。
+    # 长远来看可以考虑 embedding 向量搜索。
     async def search_notes_by_terms(self, chat_id: int, terms: list[str]) -> list[dict[str, Any]]:
         clean_terms = [term.strip() for term in terms if term.strip()]
         if not clean_terms:

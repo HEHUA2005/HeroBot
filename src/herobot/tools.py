@@ -25,6 +25,10 @@ class ToolContext:
         return self.owner_user_id if self.owner_user_id is not None else self.user_id
 
 
+# REVIEW: context_from_payload 对参数的提取非常脆弱。
+# raw.get("chat_id", 0) 默认为 0——如果 MCP 上下文注入出问题，chat_id=0 会导致
+# 所有数据写到一个"幽灵会话"里，而且不会报错，用户完全感知不到。
+# 建议 chat_id 和 user_id 缺失时直接抛异常，而不是静默用 0。
 def context_from_payload(payload: dict[str, Any], default_timezone: str = "Asia/Shanghai") -> ToolContext:
     raw = payload.get(HIDDEN_CONTEXT_KEY) or {}
     return ToolContext(
@@ -58,6 +62,19 @@ class BusinessTools:
         except Exception as exc:
             return error_result(exc)
 
+    # REVIEW: 这个巨大的 if/elif 链是典型的"面条式分发"。现在有 ~18 个工具，
+    # 每加一个新工具就要在这里加一个 if 分支、在 mcp_server.py 加一个 @mcp.tool 函数、
+    # 可能还要在 storage.py 加方法——三个文件联动改。
+    #
+    # 更好的方式是用注册表模式（dispatch table）：
+    #   _handlers = {"create_todo": self._create_todo, "list_todos": self._list_todos, ...}
+    #   return await self._handlers[name](arguments, context)
+    # 或者用装饰器模式自动注册。这样加新工具只需要写一个方法并注册。
+    #
+    # 另外注意：所有工具参数都是 dict[str, Any]，没有任何校验。
+    # 如果 LLM 漏传了 "title" 参数，这里会直接 KeyError 崩溃，
+    # 用户看到的是 "Agent 执行失败：'title'"——完全看不懂。
+    # 建议用 pydantic 或 dataclass 做参数校验，给用户友好的错误提示。
     async def _invoke(self, name: str, arguments: dict[str, Any], context: ToolContext) -> Any:
         if name == "create_todo":
             return await self.storage.create_todo(
@@ -162,6 +179,14 @@ class BusinessTools:
             to_utc_iso(end),
         )
 
+    # REVIEW: find_availability 返回的是 UTC ISO 字符串。用户看到的会是类似
+    # "2026-06-04T01:00:00+00:00" 这种格式——对于一个中文用户来说完全不友好。
+    # 虽然 LLM 理论上会帮忙转换显示，但如果 LLM 不转换（或者转换错了），
+    # 用户体验会很差。建议在返回结果中同时包含 UTC 和本地时间的可读格式，
+    # 例如 {"start_at": "...", "display": "2026-06-04 09:00 (CST)"}。
+    #
+    # 另外 find_free_windows 的 limit 默认是 3，只返回前 3 个空闲段。
+    # 如果用户查"这周有空吗"，只看到 3 个可能不够。这个 limit 应该可配置。
     async def find_availability(
         self, arguments: dict[str, Any], context: ToolContext
     ) -> list[dict[str, str]]:

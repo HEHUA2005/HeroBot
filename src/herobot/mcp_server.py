@@ -17,6 +17,14 @@ mcp = FastMCP(
     ),
 )
 
+# REVIEW: 用 module-level 全局变量 + global 做懒初始化是经典的 bad smell。
+# 问题：
+# 1. 不可测试——单元测试无法轻松替换 _business_tools，也无法在测试间重置状态
+# 2. 不可配置——Storage 路径和 timezone 在首次调用时就固化了
+# 3. 没有清理机制——进程退出时 Storage 连接（如果改为持久连接的话）没有关闭入口
+# 4. 线程安全问题——虽然 MCP server 通常是单线程的，但这个模式本身不安全
+#
+# 建议用 FastMCP 的 lifespan 钩子来管理初始化和清理，或者至少封装成一个类。
 _business_tools: BusinessTools | None = None
 _initialized = False
 
@@ -44,6 +52,17 @@ async def invoke(
     return await tools.invoke(name, arguments, context({ "herobot_context": herobot_context or {} }))
 
 
+# REVIEW: 下面所有 @mcp.tool 函数都是纯粹的样板代码——每个函数只是把参数打包成 dict
+# 然后调用 invoke()。这意味着每加一个新工具，你要：
+# 1. 在 tools.py 的 _invoke 里加一个 if 分支
+# 2. 在这里写一个一模一样的 @mcp.tool 包装函数
+# 3. 可能在 storage.py 里加一个方法
+#
+# 这种重复劳动完全可以通过元编程消除。比如可以：
+# - 定义一个 tool 描述的 registry，自动生成 MCP tool 注册
+# - 或者让 BusinessTools 的方法直接用装饰器注册为 MCP tool
+#
+# 当前 ~20 个工具函数占了 200+ 行代码，实际逻辑为零。
 @mcp.tool(description="Create a personal todo item.")
 async def create_todo(title: str, herobot_context: dict[str, Any] | None = None) -> dict[str, Any]:
     return await invoke("create_todo", {"title": title}, herobot_context)

@@ -86,6 +86,14 @@ def event_overlaps(event: dict[str, Any], start: datetime, end: datetime) -> boo
     return event_start < end and event_end > start
 
 
+# REVIEW: find_free_windows 的行为对用户来说可能不符合直觉：
+# 它在每个空闲间隙只返回从间隙起始算起的 duration_minutes 长的一段。
+# 比如 9:00-12:00 是空闲的，duration=30min，它只返回 9:00-9:30。
+# 但用户可能想知道"9:00-12:00 整段都是空的"——而不仅仅是最早的一个 30 分钟槽。
+#
+# 在用作"查看空闲时间"时，应该返回完整的空闲区间；
+# 在用作"约时间找候选"时，才需要按 duration 切割成具体候选。
+# 当前一个函数兼顾两种用途，结果两边都不完美。建议拆成两个函数。
 def find_free_windows(
     events: list[dict[str, Any]],
     window: TimeWindow,

@@ -54,6 +54,15 @@ def main() -> None:
             processes.append(process)
             print(f"started {name}: pid={process.pid} env={env_file}", flush=True)
 
+        # REVIEW: 用 time.sleep(1) 轮询检查子进程状态是比较原始的做法。
+        # 问题：
+        # 1. 浪费 CPU——每秒唤醒一次检查所有进程
+        # 2. 一个进程异常退出会立即 SystemExit，其他正常运行的进程会被 finally 终止。
+        #    在生产环境中，应该有重启策略而不是全部停掉。
+        # 3. 没有日志——stdout/stderr 没有被捕获或转发，子进程的输出可能丢失
+        #
+        # 建议用 asyncio.create_subprocess_exec 配合 asyncio.gather，
+        # 或者用 supervisor/systemd 来管理多进程。
         while processes:
             for process in list(processes):
                 code = process.poll()

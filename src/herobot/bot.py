@@ -124,7 +124,17 @@ def strip_bot_mention(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     return text.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "").strip()
 
 
+# REVIEW: parse_scheduling_confirmation 放在 bot.py 里违反了关注点分离。
+# 这是纯业务逻辑（解析用户的确认意图），跟 Telegram 适配层无关。
+# 应该放到 agent.py 或单独的 parsing 模块。
+#
+# 而且这个函数目前只在 test_core.py 里被测试，在运行时代码中并没有被调用！
+# 看起来像是写了但忘了集成到 handle_message 流程中。
+# 如果意图是在用户确认时走快速路径（不经过 LLM），那应该在 handle_message 里
+# 先尝试 parse，命中了直接调用 confirm_scheduling_candidate，省一次 LLM 调用。
 def parse_scheduling_confirmation(text: str, allow_soft_confirmation: bool) -> int | None:
+    # REVIEW: import re 应该放在文件顶部，不要在函数内部 import。
+    # 这个文件的其他地方没用 re，但这不是理由——PEP 8 明确建议 import 放在文件开头。
     import re
 
     normalized = (
@@ -208,6 +218,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # REVIEW: 用 `del context` 来消除 unused parameter 警告是 anti-pattern。
+    # 惯用做法是把参数名改为 `_context` 或 `context: ContextTypes.DEFAULT_TYPE  # noqa`。
+    # `del` 一个参数让人以为这里有什么特殊意图，实际上只是想消除 lint 警告。
     del context
     if update.effective_message is None or update.effective_user is None:
         return
@@ -309,6 +322,14 @@ async def run_agent_for_update(
         await agent.handle_event(event, platform_tools)
     except Exception as exc:
         logging.getLogger(__name__).exception("Agent event handling failed")
+        # REVIEW: 把原始异常信息直接展示给用户是很糟糕的用户体验。
+        # 用户看到 "Agent 执行失败：'title'" 或 "Agent 执行失败：Connection refused"
+        # 完全不知道该怎么办。应该给用户一个友好的提示，比如：
+        # "抱歉，我遇到了一些问题，请稍后再试。如果持续出现，请联系管理员。"
+        # 详细的错误信息只应该出现在服务端日志里（上面的 logger.exception 已经做了）。
+        #
+        # 另外这里还有一个安全问题：异常信息可能泄露内部实现细节，
+        # 比如数据库路径、API key 格式错误等敏感信息。
         await update.effective_message.reply_text(f"Agent 执行失败：{exc}")
 
 
@@ -384,6 +405,18 @@ async def post_shutdown(app: Application) -> None:
     await agent.close()
 
 
+# REVIEW: build_application 把大量配置塞进 bot_data 字典，用字符串 key 访问。
+# 这是一种"穷人的依赖注入"——没有类型检查、没有自动补全、拼错 key 名只有运行时才发现。
+# 比如 bot_data["alowed_user_ids"]（少打一个 l）不会有任何编译期错误。
+#
+# 更好的做法是定义一个 BotConfig dataclass，所有配置项都是带类型的字段，
+# 然后 app.bot_data["config"] = BotConfig(...)，或者直接用 python-telegram-bot
+# 的 ContextTypes 自定义 context 类型。
+#
+# 另外 app.bot_data["owner_user_ids"] = allowed_user_ids 把 "allowed" 和 "owner"
+# 等同了，但概念上它们不一样——owner 应该只有一个（bot 的主人），allowed 可以有多个
+# （被允许使用的人）。如果 allowed 列表里有朋友的 id，他们也会变成 "owner"，
+# 导致日程数据错乱（日程是按 owner_user_id 隔离的）。
 def build_application(
     token: str,
     user_whitelist_enabled: bool,

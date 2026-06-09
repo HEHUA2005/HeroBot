@@ -44,6 +44,10 @@ class MCPToolRegistry:
         self._tools: list[Any] = []
         self._tool_names: set[str] = set()
 
+    # REVIEW: 每次访问 tool_names 都创建一个新的 set 拷贝。
+    # 这个 property 在 agent 的每一步都被调用（通过 `name in self.tool_registry.tool_names`），
+    # 虽然性能影响很小，但这种防御性拷贝没有必要——_tool_names 在 start() 之后就不变了。
+    # 直接返回 self._tool_names 即可，或者在 start() 之后用 frozenset。
     @property
     def tool_names(self) -> set[str]:
         return set(self._tool_names)
@@ -88,6 +92,12 @@ class MCPToolRegistry:
             for tool in self._tools
         ]
 
+    # REVIEW: MCP tool 调用（通过子进程 stdio 通信）没有超时设置。
+    # 如果 MCP server 子进程卡住或崩溃，这个 await 会永远挂起，
+    # 导致整个 agent 停止响应。应该加 asyncio.wait_for 设置超时。
+    #
+    # 另外如果 MCP server 进程意外退出，_session 还是非 None，
+    # 后续调用会得到难以理解的管道错误。需要健康检查或重连机制。
     async def call(self, name: str, arguments: dict[str, Any], context: ToolContext) -> str:
         if self._session is None:
             raise RuntimeError("MCP tool registry has not been started")

@@ -81,6 +81,16 @@ class TelegramPlatformTools:
             return dumps_result({"ok": True, "result": self.finish_payload})
         return dumps_result({"ok": False, "error": f"unknown platform tool: {name}"})
 
+    # REVIEW: _send_telegram_message 没有做 Telegram API 的错误处理。
+    # Telegram sendMessage 可能因为很多原因失败：
+    # - 消息太长（Telegram 限制 4096 字符）
+    # - bot 被踢出群
+    # - reply_to_message_id 指向的消息已被删除
+    # - 频率限制（429）
+    #
+    # 当前任何失败都会抛异常上去，最终变成 "Agent 执行失败：..."。
+    # 特别是消息长度——如果 LLM 生成了超长文本，应该自动截断或分段发送。
+    # 这是一个很常见的用户可见问题。
     async def _send_telegram_message(self, arguments: dict[str, Any]) -> str:
         text = str(arguments.get("text", "")).strip()
         if not text:
