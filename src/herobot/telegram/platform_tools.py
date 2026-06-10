@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from typing import Any
 
 from telegram.error import BadRequest
@@ -8,6 +10,10 @@ from telegram.ext import ContextTypes
 
 from herobot.agent import AgentEvent
 from herobot.core.conversation_store import ConversationStore, dumps_result
+
+
+logger = logging.getLogger(__name__)
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 PLATFORM_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -154,24 +160,51 @@ class TelegramPlatformTools:
             send_kwargs["message_thread_id"] = self.event.message_thread_id
 
         try:
-            sent = await self.telegram_context.bot.send_message(**send_kwargs)
+            sent_messages = await self._send_chunks(send_kwargs, outbound_text)
         except BadRequest as exc:
             if reply_to_message_id is None or "message to be replied not found" not in str(exc).lower():
-                raise
+                logger.exception("Telegram send_message failed with BadRequest.")
+                return dumps_result({"ok": False, "error": "telegram send failed"})
             send_kwargs.pop("reply_to_message_id", None)
-            sent = await self.telegram_context.bot.send_message(**send_kwargs)
+            try:
+                sent_messages = await self._send_chunks(send_kwargs, outbound_text)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Telegram send_message retry without reply failed.")
+                return dumps_result({"ok": False, "error": "telegram send failed"})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Telegram send_message failed.")
+            return dumps_result({"ok": False, "error": "telegram send failed"})
+
         await self.storage.add_message(self.event.chat_id, "assistant", outbound_text)
+        last_message = sent_messages[-1]
         return dumps_result(
             {
                 "ok": True,
                 "result": {
-                    "chat_id": sent.chat_id,
-                    "message_id": sent.message_id,
+                    "chat_id": last_message.chat_id,
+                    "message_id": last_message.message_id,
+                    "message_ids": [item.message_id for item in sent_messages],
                     "target_username": target_username or None,
                     "text": outbound_text,
+                    "chunks": len(sent_messages),
                 },
             }
         )
+
+    async def _send_chunks(self, send_kwargs: dict[str, Any], outbound_text: str) -> list[Any]:
+        sent_messages: list[Any] = []
+        chunks = split_telegram_text(outbound_text)
+        for index, chunk in enumerate(chunks):
+            chunk_kwargs = dict(send_kwargs)
+            chunk_kwargs["text"] = chunk
+            if index > 0:
+                chunk_kwargs.pop("reply_to_message_id", None)
+            sent_messages.append(await self.telegram_context.bot.send_message(**chunk_kwargs))
+        return sent_messages
 
     def _compose_outbound_text(self, text: str, target_username: str) -> str:
         if not target_username:
@@ -209,3 +242,25 @@ class RecordingPlatformTools:
                 ensure_ascii=False,
             )
         return json.dumps({"ok": True, "result": arguments}, ensure_ascii=False)
+
+
+def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = limit
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip("\n ")
+    if remaining:
+        chunks.append(remaining)
+    return chunks

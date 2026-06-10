@@ -306,7 +306,8 @@ class Agent:
 
     async def _maybe_summarize(self, chat_id: int) -> None:
         count = await self.storage.message_count(chat_id)
-        if count < SUMMARY_THRESHOLD or count % SUMMARY_THRESHOLD != 0:
+        last_summary_count = await self.storage.get_summary_message_count(chat_id)
+        if count - last_summary_count < SUMMARY_THRESHOLD:
             return
         recent = await self.storage.recent_messages(chat_id, limit=SUMMARY_THRESHOLD)
         previous = await self.storage.get_summary(chat_id)
@@ -314,4 +315,4 @@ class Agent:
             summary = await self.llm.summarize(recent, previous)
         except Exception:
             return
-        await self.storage.set_summary(chat_id, summary)
+        await self.storage.set_summary(chat_id, summary, count)

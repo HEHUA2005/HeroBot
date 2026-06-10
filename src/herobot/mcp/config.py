@@ -14,3 +14,4 @@ class MCPServerConfig:
     env: dict[str, str] = field(default_factory=dict)
     exposed_tools: list[str] = field(default_factory=list)
     hidden_tools: list[str] = field(default_factory=list)
+    timeout_seconds: float = 30.0

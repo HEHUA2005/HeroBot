@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 from herobot.mcp.builtin.calendar.scheduling import (
     TimeWindow,
+    display_dt,
+    display_window,
     find_free_windows,
     from_iso,
     intersect_windows,
@@ -142,9 +144,20 @@ class CalendarTools:
             events,
             TimeWindow(start, end),
             int(arguments.get("duration_minutes", 30)),
+            limit=int(arguments.get("limit", 6)),
         )
         return [
-            {"start_at": to_utc_iso(slot.start), "end_at": to_utc_iso(slot.end)}
+            {
+                "start_at": to_utc_iso(slot.start),
+                "end_at": to_utc_iso(slot.end),
+                "start_display": display_dt(slot.start, context.timezone),
+                "end_display": display_dt(slot.end, context.timezone),
+                "display": display_window(
+                    to_utc_iso(slot.start),
+                    to_utc_iso(slot.end),
+                    context.timezone,
+                ),
+            }
             for slot in slots
         ]
 

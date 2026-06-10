@@ -42,6 +42,9 @@ class LLMAppConfig:
     api_key: str
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4.1-mini"
+    timeout_seconds: float = 60.0
+    max_retries: int = 2
+    retry_base_delay_seconds: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,11 @@ def load_config(config_path: Path | None = None) -> HeroBotConfig:
             api_key=api_key,
             base_url=os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1",
             model=os.getenv("OPENAI_MODEL") or "gpt-4.1-mini",
+            timeout_seconds=float(os.getenv("HEROBOT_LLM_TIMEOUT_SECONDS") or 60),
+            max_retries=int(os.getenv("HEROBOT_LLM_MAX_RETRIES") or 2),
+            retry_base_delay_seconds=float(
+                os.getenv("HEROBOT_LLM_RETRY_BASE_DELAY_SECONDS") or 0.5
+            ),
         ),
         commands=CommandsConfig(aliases=aliases),
         mcp_servers=_load_mcp_servers(config_data, fallback_db_path),
@@ -185,6 +193,7 @@ def _server_from_toml(raw: dict[str, Any]) -> MCPServerConfig:
         env={str(key): str(value) for key, value in dict(raw.get("env", {})).items()},
         exposed_tools=[str(item) for item in raw.get("exposed_tools", [])],
         hidden_tools=[str(item) for item in raw.get("hidden_tools", [])],
+        timeout_seconds=float(raw.get("timeout_seconds", 30)),
     )
 
 

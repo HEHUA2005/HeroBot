@@ -22,9 +22,13 @@ class ToolContext:
 
 def context_from_payload(payload: dict[str, Any], default_timezone: str = "Asia/Shanghai") -> ToolContext:
     raw = payload.get(HIDDEN_CONTEXT_KEY) or {}
+    if "chat_id" not in raw:
+        raise ValueError("missing required HeroBot context: chat_id")
+    if "user_id" not in raw:
+        raise ValueError("missing required HeroBot context: user_id")
     return ToolContext(
-        chat_id=int(raw.get("chat_id", 0)),
-        user_id=int(raw.get("user_id", 0)),
+        chat_id=int(raw["chat_id"]),
+        user_id=int(raw["user_id"]),
         chat_type=str(raw.get("chat_type", "private")),
         timezone=str(raw.get("timezone") or default_timezone),
         owner_user_id=int(raw["owner_user_id"]) if raw.get("owner_user_id") is not None else None,

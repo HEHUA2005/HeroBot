@@ -31,6 +31,8 @@ async def post_init(app: Application) -> None:
 async def post_shutdown(app: Application) -> None:
     agent: Agent = app.bot_data["agent"]
     await agent.close()
+    conversation_store: ConversationStore = app.bot_data["conversation_store"]
+    await conversation_store.close()
 
 
 def build_application(config: HeroBotConfig) -> Application:
@@ -47,6 +49,9 @@ def build_application(config: HeroBotConfig) -> Application:
             api_key=config.llm.api_key,
             base_url=config.llm.base_url,
             model=config.llm.model,
+            timeout_seconds=config.llm.timeout_seconds,
+            max_retries=config.llm.max_retries,
+            retry_base_delay_seconds=config.llm.retry_base_delay_seconds,
         )
     )
     tool_registry = MCPToolRegistry(config.mcp_servers)

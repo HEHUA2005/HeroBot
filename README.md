@@ -84,6 +84,8 @@ TELEGRAM_ALLOWED_USER_IDS=123456789
 OPENAI_API_KEY=replace-with-your-api-key
 OPENAI_BASE_URL=http://localhost:4000
 OPENAI_MODEL=your-model
+HEROBOT_LLM_TIMEOUT_SECONDS=60
+HEROBOT_LLM_MAX_RETRIES=2
 
 HEROBOT_DB_PATH=data/herobot.sqlite3
 HEROBOT_PERSONA=
@@ -106,6 +108,7 @@ name = "notes"
 command = "herobot-mcp-notes"
 enabled = true
 required = true
+timeout_seconds = 30
 env = { HEROBOT_NOTES_DB_PATH = "data/herobot-notes.sqlite3" }
 
 [[mcp.servers]]
@@ -114,6 +117,7 @@ command = "herobot-mcp-calendar"
 enabled = true
 required = true
 hidden_tools = ["list_due_reminders", "mark_reminder_sent"]
+timeout_seconds = 30
 env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
 ```
 
@@ -128,6 +132,7 @@ enabled = true
 required = false
 exposed_tools = []
 hidden_tools = []
+timeout_seconds = 30
 ```
 
 如果没有 `herobot.toml`，HeroBot 会使用内置默认配置并启动 notes/calendar 两个 builtin MCP server。旧 `HEROBOT_DB_PATH` 会作为 core、notes、calendar 的兼容 fallback。

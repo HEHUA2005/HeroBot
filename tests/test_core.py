@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ from herobot.telegram.message_utils import (
 from herobot.core.config import load_config, parse_allowed_user_ids, parse_bool
 from herobot.core.conversation_store import ConversationStore
 from herobot.core.scheduler import _deliver_reminder
+from herobot.llm import LLMClient, LLMConfig
 from herobot.mcp.builtin.calendar.scheduling import (
     TimeWindow,
     find_free_windows,
@@ -35,8 +37,8 @@ from herobot.mcp.builtin.calendar.tools import CalendarTools
 from herobot.mcp.builtin.notes.storage import NotesStorage
 from herobot.mcp.builtin.notes.tools import NotesTools
 from herobot.mcp.config import MCPServerConfig
-from herobot.mcp.context import ToolContext
-from herobot.mcp.registry import MCPToolRegistry, _MCPServerConnection
+from herobot.mcp.context import ToolContext, context_from_payload
+from herobot.mcp.registry import MCPToolRegistry, _MCPServerConnection, _ToolBinding
 from herobot.agent import Agent, AgentEvent
 from herobot.agent.task import (
     ActionLedger,
@@ -44,7 +46,11 @@ from herobot.agent.task import (
     deterministic_finish_check,
     infer_expected_messages,
 )
-from herobot.telegram.platform_tools import RecordingPlatformTools, TelegramPlatformTools
+from herobot.telegram.platform_tools import (
+    RecordingPlatformTools,
+    TelegramPlatformTools,
+    split_telegram_text,
+)
 from herobot.telegram.commands import alias_to_text, command_name
 from herobot.telegram.message_utils import strip_bot_mention
 
@@ -76,9 +82,35 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             ):
                 config = load_config(Path(tmp) / "missing.toml")
             self.assertEqual(config.core.core_db_path, db_path)
+            self.assertEqual(config.llm.timeout_seconds, 60)
+            self.assertEqual(config.llm.max_retries, 2)
             self.assertEqual({server.name for server in config.mcp_servers}, {"notes", "calendar"})
             calendar = next(server for server in config.mcp_servers if server.name == "calendar")
             self.assertIn("list_due_reminders", calendar.hidden_tools)
+
+    def test_config_loads_llm_retry_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "OPENAI_API_KEY": "key",
+                    "HEROBOT_LLM_TIMEOUT_SECONDS": "12.5",
+                    "HEROBOT_LLM_MAX_RETRIES": "4",
+                    "HEROBOT_LLM_RETRY_BASE_DELAY_SECONDS": "0.25",
+                },
+                clear=False,
+            ):
+                config = load_config(Path(tmp) / "missing.toml")
+            self.assertEqual(config.llm.timeout_seconds, 12.5)
+            self.assertEqual(config.llm.max_retries, 4)
+            self.assertEqual(config.llm.retry_base_delay_seconds, 0.25)
+
+    def test_context_from_payload_requires_chat_and_user(self) -> None:
+        with self.assertRaisesRegex(ValueError, "chat_id"):
+            context_from_payload({"herobot_context": {"user_id": 20}})
+        with self.assertRaisesRegex(ValueError, "user_id"):
+            context_from_payload({"herobot_context": {"chat_id": 10}})
 
     def test_bot_to_bot_helpers(self) -> None:
         self.assertEqual(parse_bot_usernames("@Other_Bot, review_bot"), {"other_bot", "review_bot"})
@@ -153,9 +185,51 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("create_note", prompt)
         self.assertIn("未列出的工具", prompt)
 
+    async def test_llm_chat_retries_transient_failures(self) -> None:
+        llm = LLMClient(
+            LLMConfig(
+                api_key="key",
+                base_url="http://localhost:4000",
+                model="model",
+                timeout_seconds=1,
+                max_retries=1,
+                retry_base_delay_seconds=0,
+            )
+        )
+        completions = FakeCompletions([RuntimeError("temporary"), FakeResponse(FakeMessage(content="ok"))])
+        llm.client = FakeOpenAIClient(completions)
+
+        with self.assertLogs("herobot.llm", level="WARNING"):
+            response = await llm.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(completions.calls, 2)
+
+    async def test_llm_summarize_uses_json_message_format(self) -> None:
+        llm = LLMClient(
+            LLMConfig(
+                api_key="key",
+                base_url="http://localhost:4000",
+                model="model",
+                timeout_seconds=1,
+                max_retries=0,
+            )
+        )
+        completions = FakeCompletions([FakeResponse(FakeMessage(content="摘要"))])
+        llm.client = FakeOpenAIClient(completions)
+
+        summary = await llm.summarize([{"role": "user", "content": "hello"}], "旧摘要")
+
+        self.assertEqual(summary, "摘要")
+        content = completions.last_kwargs["messages"][1]["content"]
+        self.assertIn("新消息 JSON", content)
+        self.assertIn('"role": "user"', content)
+        self.assertNotIn("[{'role':", content)
+
     async def test_recent_messages_filters_roles_before_limit_and_excludes_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             await storage.add_message(10, "user", "old user")
             await storage.add_message(10, "tool", "tool observation")
@@ -175,6 +249,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_messages_does_not_duplicate_current_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             agent = Agent(storage=storage, llm=FakeLLM([]), tool_registry=FakeRegistry())
             event = AgentEvent(
@@ -203,6 +278,22 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 sum(event.as_prompt() in item.get("content", "") for item in messages),
                 1,
             )
+
+    async def test_summary_runs_when_message_delta_exceeds_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            for index in range(25):
+                await storage.add_message(10, "user", f"message {index}")
+            llm = SummarizingFakeLLM("新的摘要")
+            agent = Agent(storage=storage, llm=llm, tool_registry=FakeRegistry())
+
+            await agent._maybe_summarize(10)
+
+            self.assertEqual(llm.summarize_calls, 1)
+            self.assertEqual(await storage.get_summary(10), "新的摘要")
+            self.assertEqual(await storage.get_summary_message_count(10), 25)
 
     def test_task_frame_infers_counting_sequence(self) -> None:
         self.assertEqual(infer_expected_messages("挨个报数，数到10"), [str(i) for i in range(1, 11)])
@@ -298,6 +389,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_storage_backed_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = NotesStorage(str(Path(tmp) / "notes.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             tools = NotesTools(storage)
             context = ToolContext(chat_id=10, user_id=20)
@@ -321,6 +413,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_reminder_time_is_stored_as_utc(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = CalendarStorage(str(Path(tmp) / "calendar.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             tools = CalendarTools(storage)
             context = ToolContext(chat_id=10, user_id=20)
@@ -339,6 +432,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_contacts_calendar_and_availability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = CalendarStorage(str(Path(tmp) / "calendar.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             contact = await storage.upsert_contact("李雷", "@lilei_bot")
             self.assertEqual(contact["bot_username"], "lilei_bot")
@@ -365,6 +459,21 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(common), 1)
             self.assertEqual(common[0].start.hour, 9)
             self.assertEqual(common[0].start.minute, 0)
+
+            tools = CalendarTools(storage)
+            availability = await tools.invoke(
+                "find_availability",
+                {
+                    "start_at": "2026-06-04T09:00:00+08:00",
+                    "end_at": "2026-06-04T12:00:00+08:00",
+                    "duration_minutes": 30,
+                    "limit": 6,
+                },
+                ToolContext(chat_id=10, user_id=20, owner_user_id=20),
+            )
+            self.assertTrue(availability["ok"])
+            self.assertIn("display", availability["result"][0])
+            self.assertEqual(availability["result"][0]["display"], "2026-06-04 09:00-09:30")
 
     def test_windows_are_merged_before_intersection(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
@@ -501,6 +610,30 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command, sys.executable)
         self.assertEqual(args, ["-m", "herobot.mcp.builtin.notes.server", "--example"])
 
+    async def test_mcp_connection_call_times_out(self) -> None:
+        connection = _MCPServerConnection(
+            MCPServerConfig(name="slow", command="unused", timeout_seconds=0.01)
+        )
+        connection._session = FakeSlowSession()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await connection.call("slow_tool", {})
+
+    async def test_mcp_registry_returns_error_on_tool_timeout(self) -> None:
+        registry = MCPToolRegistry([])
+        registry._servers = [FakeTimeoutMCPConnection()]
+        registry._bindings = {
+            "slow_tool": _ToolBinding("slow", FakeMCPTool(), hidden=False),
+        }
+
+        with self.assertLogs("herobot.mcp.registry", level="WARNING"):
+            result = json.loads(
+                await registry.call("slow_tool", {}, ToolContext(chat_id=10, user_id=20))
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("timed out", result["error"])
+
     async def test_agent_runtime_uses_mcp_and_finish_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
@@ -509,6 +642,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             env["HEROBOT_NOTES_DB_PATH"] = notes_db_path
             env["PYTHONPATH"] = str(Path.cwd() / "src")
             storage = ConversationStore(core_db_path)
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             registry = MCPToolRegistry(
                 MCPServerConfig(
@@ -582,6 +716,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(platform.finished)
                 self.assertIn("send_telegram_message", [name for name, _ in platform.calls])
                 notes_storage = NotesStorage(notes_db_path)
+                self.addAsyncCleanup(notes_storage.close)
                 await notes_storage.init()
                 notes = await notes_storage.search_notes(10, "学校")
                 self.assertEqual(notes[0]["content"], "上海交通大学")
@@ -591,6 +726,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_rejects_finish_until_expected_messages_are_sent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             registry = FakeRegistry()
             llm = FakeLLM(
@@ -667,6 +803,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_platform_retries_when_reply_message_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "platform.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             event = AgentEvent(
                 source="telegram",
@@ -693,6 +830,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_platform_can_send_multiple_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "platform.sqlite3"))
+            self.addAsyncCleanup(storage.close)
             await storage.init()
             event = AgentEvent(
                 source="telegram",
@@ -714,6 +852,43 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(result["ok"])
             self.assertEqual([item["text"] for item in fake_context.bot.calls], ["1", "2", "3"])
+
+    def test_split_telegram_text_respects_message_limit(self) -> None:
+        chunks = split_telegram_text("a" * 4090 + "\n" + "b" * 20)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(all(len(chunk) <= 4096 for chunk in chunks))
+        self.assertEqual("".join(chunks), "a" * 4090 + "b" * 20)
+
+    async def test_telegram_platform_splits_long_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "platform.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="private",
+                message_id=99,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="long",
+                addressed_to_self=True,
+                owner_user_id=20,
+            )
+            fake_context = FakeTelegramContext()
+            fake_context.bot.fail_first_reply = False
+            platform = TelegramPlatformTools(fake_context, storage, event)
+
+            result = json.loads(
+                await platform.call("send_telegram_message", {"text": "x" * 4100})
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["result"]["chunks"], 2)
+            self.assertEqual(len(fake_context.bot.calls), 2)
+            self.assertTrue(all(len(item["text"]) <= 4096 for item in fake_context.bot.calls))
 
 
 class FakeFunction:
@@ -763,6 +938,43 @@ class FakeLLM:
         return previous_summary
 
 
+class SummarizingFakeLLM(FakeLLM):
+    def __init__(self, summary: str) -> None:
+        super().__init__([])
+        self.summary = summary
+        self.summarize_calls = 0
+
+    async def summarize(self, messages, previous_summary=""):
+        del messages, previous_summary
+        self.summarize_calls += 1
+        return self.summary
+
+
+class FakeCompletions:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+        self.last_kwargs = {}
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        self.last_kwargs = kwargs
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class FakeOpenAIChat:
+    def __init__(self, completions: FakeCompletions) -> None:
+        self.completions = completions
+
+
+class FakeOpenAIClient:
+    def __init__(self, completions: FakeCompletions) -> None:
+        self.chat = FakeOpenAIChat(completions)
+
+
 class FakeConversationStore:
     pass
 
@@ -786,10 +998,28 @@ class FakeHiddenRegistry:
     def __init__(self) -> None:
         self.hidden_calls = []
 
-    async def call_hidden(self, name, arguments, context):
-        del context
+    async def call_hidden(self, name, arguments, _context):
         self.hidden_calls.append((name, arguments))
         return json.dumps({"ok": True, "result": {"marked": True}}, ensure_ascii=False)
+
+
+class FakeSlowSession:
+    async def call_tool(self, name, payload):
+        del name, payload
+        await asyncio.sleep(1)
+
+
+class FakeTimeoutMCPConnection:
+    config = MCPServerConfig(name="slow", command="unused", timeout_seconds=0.01)
+
+    async def call(self, name, payload):
+        del name, payload
+        raise asyncio.TimeoutError()
+
+
+class FakeMCPTool:
+    description = ""
+    inputSchema = {}
 
 
 class FakeSchedulerApp:

@@ -23,6 +23,7 @@ enabled = true
 required = true
 exposed_tools = []
 hidden_tools = []
+timeout_seconds = 30
 env = { HEROBOT_NOTES_DB_PATH = "data/herobot-notes.sqlite3" }
 
 [[mcp.servers]]
@@ -33,6 +34,7 @@ enabled = true
 required = true
 exposed_tools = []
 hidden_tools = ["list_due_reminders", "mark_reminder_sent"]
+timeout_seconds = 30
 env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
 
 # External MCP server example:
@@ -45,3 +47,4 @@ env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
 # required = false
 # exposed_tools = []
 # hidden_tools = []
+# timeout_seconds = 30

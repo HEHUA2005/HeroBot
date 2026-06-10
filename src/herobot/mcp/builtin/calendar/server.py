@@ -46,7 +46,11 @@ async def invoke(
     name: str, arguments: dict[str, Any], herobot_context: dict[str, Any] | None
 ) -> dict[str, Any]:
     tools = await calendar_tools()
-    return await tools.invoke(name, arguments, context({HIDDEN_CONTEXT_KEY: herobot_context or {}}))
+    try:
+        tool_context = context({HIDDEN_CONTEXT_KEY: herobot_context or {}})
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return await tools.invoke(name, arguments, tool_context)
 
 
 @mcp.tool(description="Create a Telegram reminder. remind_at must be ISO 8601 with timezone.")
@@ -152,6 +156,7 @@ async def find_availability(
     start_at: str,
     end_at: str,
     duration_minutes: int = 30,
+    limit: int = 6,
     herobot_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await invoke(
@@ -160,6 +165,7 @@ async def find_availability(
             "start_at": start_at,
             "end_at": end_at,
             "duration_minutes": duration_minutes,
+            "limit": limit,
         },
         herobot_context,
     )

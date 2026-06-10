@@ -77,15 +77,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(HELP_TEXT)
 
 
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def whoami(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message is None or update.effective_user is None:
         return
     await update.effective_message.reply_text(f"你的 Telegram user id：{update.effective_user.id}")
 
 
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def chatid(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message is None or update.effective_chat is None:
         return
     await update.effective_message.reply_text(
@@ -215,9 +213,11 @@ async def run_agent_for_update(
     await update.effective_chat.send_action(ChatAction.TYPING)
     try:
         await agent.handle_event(event, platform_tools)
-    except Exception as exc:
+    except Exception:
         logger.exception("Agent event handling failed")
-        await update.effective_message.reply_text(f"Agent 执行失败：{exc}")
+        await update.effective_message.reply_text(
+            "我这轮处理失败了，已经记录错误。请稍后重试，或把任务拆小一点再发我。"
+        )
 
 
 async def handle_command_as_agent(

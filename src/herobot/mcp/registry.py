@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -72,7 +73,10 @@ class _MCPServerConnection:
     async def call(self, name: str, payload: dict[str, Any]) -> Any:
         if self._session is None:
             raise RuntimeError(f"MCP server is not started: {self.config.name}")
-        return await self._session.call_tool(name, payload)
+        return await asyncio.wait_for(
+            self._session.call_tool(name, payload),
+            timeout=self.config.timeout_seconds,
+        )
 
     def _resolved_command(self, env: dict[str, str]) -> tuple[str, list[str]]:
         module = BUILTIN_COMMAND_MODULES.get(self.config.command)
@@ -86,14 +90,16 @@ class MCPToolRegistry:
         self.server_configs = server_configs if isinstance(server_configs, list) else [server_configs]
         self._servers: list[_MCPServerConnection] = []
         self._bindings: dict[str, _ToolBinding] = {}
+        self._tool_names: frozenset[str] = frozenset()
+        self._hidden_tool_names: frozenset[str] = frozenset()
 
     @property
-    def tool_names(self) -> set[str]:
-        return {name for name, binding in self._bindings.items() if not binding.hidden}
+    def tool_names(self) -> frozenset[str]:
+        return self._tool_names
 
     @property
-    def hidden_tool_names(self) -> set[str]:
-        return {name for name, binding in self._bindings.items() if binding.hidden}
+    def hidden_tool_names(self) -> frozenset[str]:
+        return self._hidden_tool_names
 
     async def start(self) -> None:
         if self._servers:
@@ -119,6 +125,8 @@ class MCPToolRegistry:
                 await connection.close()
             self._servers = []
             self._bindings = {}
+            self._tool_names = frozenset()
+            self._hidden_tool_names = frozenset()
             raise
 
     async def close(self) -> None:
@@ -126,6 +134,8 @@ class MCPToolRegistry:
             await connection.close()
         self._servers = []
         self._bindings = {}
+        self._tool_names = frozenset()
+        self._hidden_tool_names = frozenset()
 
     def openai_tool_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -175,7 +185,23 @@ class MCPToolRegistry:
             "timezone": context.timezone,
             "owner_user_id": context.effective_owner_user_id,
         }
-        result = await connection.call(name, payload)
+        try:
+            result = await connection.call(name, payload)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP tool call timed out server=%s tool=%s timeout=%ss",
+                binding.server_name,
+                name,
+                connection.config.timeout_seconds,
+            )
+            return dumps_result(
+                {
+                    "ok": False,
+                    "error": (
+                        f"MCP tool timed out after {connection.config.timeout_seconds:g}s: {name}"
+                    ),
+                }
+            )
         if result.isError:
             return dumps_result({"ok": False, "error": self._content_to_text(result.content)})
         if result.structuredContent is not None:
@@ -205,6 +231,12 @@ class MCPToolRegistry:
                     )
                 bindings[tool.name] = _ToolBinding(config.name, tool, hidden)
         self._bindings = bindings
+        self._tool_names = frozenset(
+            name for name, binding in bindings.items() if not binding.hidden
+        )
+        self._hidden_tool_names = frozenset(
+            name for name, binding in bindings.items() if binding.hidden
+        )
 
     def _server(self, server_name: str) -> _MCPServerConnection:
         for connection in self._servers:
