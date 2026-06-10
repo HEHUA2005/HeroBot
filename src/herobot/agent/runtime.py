@@ -20,6 +20,17 @@ from herobot.mcp.registry import MCPToolRegistry
 
 
 SUMMARY_THRESHOLD = 24
+SIDE_EFFECT_TOOL_PREFIXES = (
+    "add_",
+    "cancel_",
+    "complete_",
+    "confirm_",
+    "create_",
+    "delete_",
+    "mark_",
+    "start_",
+    "update_",
+)
 
 
 class PlatformTools(Protocol):
@@ -96,7 +107,13 @@ class Agent:
         )
 
         for step in range(self.max_steps):
-            response = await self.llm.chat(messages, tools=tools)
+            try:
+                response = await self.llm.chat(messages, tools=tools)
+            except Exception:
+                logging.getLogger(__name__).exception("Agent LLM step failed.")
+                if await self._recover_from_llm_step_failure(task, ledger, platform_tools):
+                    break
+                raise
             assistant_message = response.choices[0].message
             tool_calls = assistant_message.tool_calls or []
 
@@ -159,17 +176,24 @@ class Agent:
 
             if platform_tools.finished:
                 break
+            messages.append({"role": "system", "content": self._ledger_update_prompt(task, ledger)})
         else:
-            await platform_tools.call(
-                "send_telegram_message",
-                {"text": "这轮任务执行步数达到了上限，我先停下来。你可以把目标拆小一点再发我。"},
-            )
+            should_warn = self._should_warn_max_steps(task, ledger)
+            if should_warn:
+                await platform_tools.call(
+                    "send_telegram_message",
+                    {"text": "这轮任务执行步数达到了上限，我先停下来。你可以把目标拆小一点再发我。"},
+                )
             await platform_tools.call(
                 "finish_task",
                 {
-                    "status": "failed",
-                    "summary": "agent max steps reached",
-                    "needs_user_input": True,
+                    "status": "failed" if should_warn or ledger.has_failures() else "done",
+                    "summary": (
+                        "agent max steps reached"
+                        if should_warn
+                        else "agent sent a user-facing response before max steps"
+                    ),
+                    "needs_user_input": should_warn,
                 },
             )
 
@@ -198,6 +222,8 @@ class Agent:
         if str(finish_payload.get("status", "done")) != "done":
             return decision
         if task.expected_messages:
+            return decision
+        if ledger.sent_messages and not ledger.has_failures():
             return decision
         llm_decision = await self._llm_finish_check(task, ledger, finish_payload)
         return llm_decision or decision
@@ -286,6 +312,61 @@ class Agent:
             lines.append(f"- {name}: {description}")
         return "\n".join(lines)
 
+    def _ledger_update_prompt(self, task: TaskFrame, ledger: ActionLedger) -> str:
+        return (
+            "ActionLedger 已更新。请根据下面的实际工具结果决定下一步：\n"
+            f"{ledger.as_prompt()}\n\n"
+            "如果任务已经完成，下一步必须调用 finish_task。"
+            "如果还缺动作，只调用必要工具继续；不要重复已经成功完成的动作。\n"
+            f"当前 TaskFrame：\n{task.as_prompt()}"
+        )
+
+    def _should_warn_max_steps(self, task: TaskFrame, ledger: ActionLedger) -> bool:
+        if not ledger.sent_messages:
+            return True
+        return self._expected_messages_incomplete(task, ledger)
+
+    def _expected_messages_incomplete(self, task: TaskFrame, ledger: ActionLedger) -> bool:
+        if not task.expected_messages:
+            return False
+        actual = [_normalize_for_runtime(item) for item in ledger.sent_messages]
+        expected = [_normalize_for_runtime(item) for item in task.expected_messages]
+        return actual[: len(expected)] != expected
+
+    async def _recover_from_llm_step_failure(
+        self,
+        task: TaskFrame,
+        ledger: ActionLedger,
+        platform_tools: PlatformTools,
+    ) -> bool:
+        if ledger.sent_messages and not self._expected_messages_incomplete(task, ledger):
+            await platform_tools.call(
+                "finish_task",
+                {
+                    "status": "failed" if ledger.has_failures() else "done",
+                    "summary": "llm failed after user-facing response",
+                    "needs_user_input": False,
+                },
+            )
+            return True
+        if ledger.has_failures():
+            return False
+        if any(_is_side_effect_tool(entry.name) for entry in ledger.tool_calls if entry.ok):
+            await platform_tools.call(
+                "send_telegram_message",
+                {"text": _fallback_ack_text(ledger)},
+            )
+            await platform_tools.call(
+                "finish_task",
+                {
+                    "status": "done",
+                    "summary": "llm failed after successful side-effect tool call",
+                    "needs_user_input": False,
+                },
+            )
+            return True
+        return False
+
     async def _handle_missing_finish(self, content: str, platform_tools: PlatformTools) -> None:
         logging.getLogger(__name__).warning("Agent returned without finish_task or tool calls.")
         if content.strip():
@@ -316,3 +397,26 @@ class Agent:
         except Exception:
             return
         await self.storage.set_summary(chat_id, summary, count)
+
+
+def _normalize_for_runtime(text: str) -> str:
+    return str(text).strip()
+
+
+def _is_side_effect_tool(name: str) -> bool:
+    return name.startswith(SIDE_EFFECT_TOOL_PREFIXES)
+
+
+def _fallback_ack_text(ledger: ActionLedger) -> str:
+    successful_names = {entry.name for entry in ledger.tool_calls if entry.ok}
+    if "create_note" in successful_names:
+        return "已记录。"
+    if "create_todo" in successful_names:
+        return "已添加待办。"
+    if "create_reminder" in successful_names:
+        return "已设置提醒。"
+    if "add_contact" in successful_names:
+        return "已保存联系人。"
+    if "create_calendar_event" in successful_names:
+        return "已添加日程。"
+    return "已完成。"

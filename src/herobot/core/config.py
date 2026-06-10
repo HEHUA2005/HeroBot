@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 import tomllib
@@ -8,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from herobot.mcp.config import MCPServerConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_COMMAND_ALIASES = {
@@ -60,6 +65,8 @@ class HeroBotConfig:
     commands: CommandsConfig
     mcp_servers: list[MCPServerConfig]
     config_path: Path | None = None
+    mcp_json_config_paths: tuple[Path, ...] = ()
+    mcp_json_server_names: tuple[str, ...] = ()
 
 
 def parse_allowed_user_ids(value: str | None) -> set[int]:
@@ -87,6 +94,8 @@ def parse_username_set(value: str | None) -> set[str]:
 
 def load_config(config_path: Path | None = None) -> HeroBotConfig:
     config_data = _read_toml(config_path)
+    config_dir = _config_dir(config_path)
+    mcp_json_configs = _read_mcp_json_configs(config_dir)
     core_data = _section(config_data, "core")
     telegram_data = _section(config_data, "telegram")
     commands_data = _section(config_data, "commands")
@@ -108,6 +117,11 @@ def load_config(config_path: Path | None = None) -> HeroBotConfig:
 
     aliases = dict(DEFAULT_COMMAND_ALIASES)
     aliases.update(_string_map(_section(commands_data, "aliases")))
+    mcp_servers, mcp_json_server_names = _load_mcp_servers(
+        config_data,
+        fallback_db_path,
+        mcp_json_configs,
+    )
 
     return HeroBotConfig(
         core=CoreConfig(
@@ -150,8 +164,10 @@ def load_config(config_path: Path | None = None) -> HeroBotConfig:
             ),
         ),
         commands=CommandsConfig(aliases=aliases),
-        mcp_servers=_load_mcp_servers(config_data, fallback_db_path),
+        mcp_servers=mcp_servers,
         config_path=config_path if config_path and config_path.exists() else None,
+        mcp_json_config_paths=tuple(path for path, _data in mcp_json_configs),
+        mcp_json_server_names=tuple(mcp_json_server_names),
     )
 
 
@@ -164,6 +180,30 @@ def _read_toml(config_path: Path | None) -> dict[str, Any]:
         return tomllib.load(file)
 
 
+def _config_dir(config_path: Path | None) -> Path:
+    if config_path is None:
+        config_path = Path("herobot.toml")
+    parent = config_path.parent
+    return parent if str(parent) else Path(".")
+
+
+def _read_mcp_json_configs(config_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
+    configs: list[tuple[Path, dict[str, Any]]] = []
+    for filename in ("mcp.json", ".mcp.json"):
+        path = config_dir / filename
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid MCP JSON config {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Invalid MCP JSON config {path}: top-level value must be an object")
+        configs.append((path, data))
+    return configs
+
+
 def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key, {})
     return value if isinstance(value, dict) else {}
@@ -174,12 +214,16 @@ def _string_map(data: dict[str, Any]) -> dict[str, str]:
 
 
 def _load_mcp_servers(
-    config_data: dict[str, Any], fallback_db_path: str | None
-) -> list[MCPServerConfig]:
+    config_data: dict[str, Any],
+    fallback_db_path: str | None,
+    mcp_json_configs: list[tuple[Path, dict[str, Any]]],
+) -> tuple[list[MCPServerConfig], list[str]]:
     raw_servers = _section(config_data, "mcp").get("servers")
     if isinstance(raw_servers, list) and raw_servers:
-        return [_server_from_toml(item) for item in raw_servers if isinstance(item, dict)]
-    return _default_mcp_servers(fallback_db_path)
+        servers = [_server_from_toml(item) for item in raw_servers if isinstance(item, dict)]
+    else:
+        servers = _default_mcp_servers(fallback_db_path)
+    return _merge_json_mcp_servers(servers, mcp_json_configs)
 
 
 def _server_from_toml(raw: dict[str, Any]) -> MCPServerConfig:
@@ -195,6 +239,68 @@ def _server_from_toml(raw: dict[str, Any]) -> MCPServerConfig:
         hidden_tools=[str(item) for item in raw.get("hidden_tools", [])],
         timeout_seconds=float(raw.get("timeout_seconds", 30)),
     )
+
+
+def _merge_json_mcp_servers(
+    servers: list[MCPServerConfig],
+    mcp_json_configs: list[tuple[Path, dict[str, Any]]],
+) -> tuple[list[MCPServerConfig], list[str]]:
+    merged = list(servers)
+    existing_names = {server.name for server in merged}
+    appended_names: list[str] = []
+    for path, data in mcp_json_configs:
+        for server in _servers_from_mcp_json(data, path):
+            if server.name in existing_names:
+                logger.warning(
+                    "Skipping MCP JSON server %s from %s because a server with that name "
+                    "is already configured.",
+                    server.name,
+                    path,
+                )
+                continue
+            merged.append(server)
+            existing_names.add(server.name)
+            appended_names.append(server.name)
+    return merged, appended_names
+
+
+def _servers_from_mcp_json(data: dict[str, Any], path: Path) -> list[MCPServerConfig]:
+    raw_servers = data.get("mcpServers")
+    if not isinstance(raw_servers, dict):
+        raw_servers = data.get("servers")
+    if raw_servers is None:
+        return []
+    if not isinstance(raw_servers, dict):
+        raise RuntimeError(f"Invalid MCP JSON config {path}: mcpServers/servers must be an object")
+
+    servers: list[MCPServerConfig] = []
+    for name, raw in raw_servers.items():
+        if not isinstance(raw, dict):
+            logger.warning("Skipping MCP JSON server %s from %s: value must be an object.", name, path)
+            continue
+        enabled = bool(raw.get("enabled", True))
+        disabled = bool(raw.get("disabled", False))
+        if disabled or not enabled:
+            continue
+        command = str(raw.get("command") or "").strip()
+        if not command:
+            logger.warning("Skipping MCP JSON server %s from %s: command is required.", name, path)
+            continue
+        servers.append(
+            MCPServerConfig(
+                name=str(name),
+                command=command,
+                args=[str(item) for item in raw.get("args", [])],
+                enabled=True,
+                required=bool(raw.get("required", False)),
+                cwd=str(raw["cwd"]) if raw.get("cwd") else None,
+                env={str(key): str(value) for key, value in dict(raw.get("env", {})).items()},
+                exposed_tools=[str(item) for item in raw.get("exposed_tools", [])],
+                hidden_tools=[str(item) for item in raw.get("hidden_tools", [])],
+                timeout_seconds=float(raw.get("timeout_seconds", 30)),
+            )
+        )
+    return servers
 
 
 def _default_mcp_servers(fallback_db_path: str | None) -> list[MCPServerConfig]:

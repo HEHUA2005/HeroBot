@@ -52,6 +52,12 @@ def main() -> None:
         env_file,
         config.config_path or "<defaults>",
     )
+    if config.mcp_json_config_paths:
+        logging.getLogger(__name__).info(
+            "Loaded MCP JSON config(s): %s; appended servers=%s.",
+            ", ".join(str(path) for path in config.mcp_json_config_paths),
+            ",".join(config.mcp_json_server_names) or "<none>",
+        )
     build_application(config).run_polling(allowed_updates=Update.ALL_TYPES)
 
 

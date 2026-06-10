@@ -38,6 +38,7 @@ timeout_seconds = 30
 env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
 
 # External MCP server example:
+# You can also put community mcpServers JSON into ./mcp.json or ./.mcp.json.
 #
 # [[mcp.servers]]
 # name = "weather"

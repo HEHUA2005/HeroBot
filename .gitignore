@@ -1,5 +1,7 @@
 .env
 herobot.toml
+mcp.json
+.mcp.json
 .venv/
 __pycache__/
 *.py[cod]

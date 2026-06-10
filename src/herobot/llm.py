@@ -62,7 +62,10 @@ class LLMClient:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if not _is_retryable_llm_error(exc):
+                    logger.exception("LLM chat request failed with non-retryable error.")
+                    raise
                 if attempt >= self.max_retries:
                     logger.exception("LLM chat request failed after retries.")
                     raise
@@ -97,3 +100,10 @@ class LLMClient:
         ]
         response = await self.chat(prompt)
         return response.choices[0].message.content or previous_summary
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 429} or status_code >= 500
+    return True

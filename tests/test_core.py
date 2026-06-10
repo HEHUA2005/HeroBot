@@ -106,6 +106,146 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.llm.max_retries, 4)
             self.assertEqual(config.llm.retry_base_delay_seconds, 0.25)
 
+    def test_config_loads_mcp_json_with_default_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "weather": {
+                                "command": "npx",
+                                "args": ["-y", "@dangahagan/weather-mcp@latest"],
+                                "env": {"WEATHER_UNITS": "metric"},
+                                "cwd": "/tmp/weather",
+                                "timeout_seconds": 12.5,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "token", "OPENAI_API_KEY": "key"},
+                clear=False,
+            ):
+                config = load_config(root / "missing.toml")
+
+            servers = {server.name: server for server in config.mcp_servers}
+            self.assertEqual({"notes", "calendar", "weather"}, set(servers))
+            self.assertEqual(servers["weather"].command, "npx")
+            self.assertEqual(
+                servers["weather"].args,
+                ["-y", "@dangahagan/weather-mcp@latest"],
+            )
+            self.assertEqual(servers["weather"].env, {"WEATHER_UNITS": "metric"})
+            self.assertEqual(servers["weather"].cwd, "/tmp/weather")
+            self.assertEqual(servers["weather"].timeout_seconds, 12.5)
+            self.assertFalse(servers["weather"].required)
+            self.assertEqual(config.mcp_json_config_paths, (root / "mcp.json",))
+            self.assertEqual(config.mcp_json_server_names, ("weather",))
+
+    def test_config_merges_toml_and_mcp_json_with_toml_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "herobot.toml"
+            config_path.write_text(
+                """
+                [[mcp.servers]]
+                name = "weather"
+                command = "python"
+                args = ["-m", "toml_weather"]
+                required = true
+                """,
+                encoding="utf-8",
+            )
+            (root / "mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "weather": {"command": "npx", "args": ["json-weather"]},
+                            "search": {"command": "uvx", "args": ["search-mcp"]},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "token", "OPENAI_API_KEY": "key"},
+                clear=False,
+            ):
+                with self.assertLogs("herobot.core.config", level="WARNING"):
+                    config = load_config(config_path)
+
+            servers = {server.name: server for server in config.mcp_servers}
+            self.assertEqual({"weather", "search"}, set(servers))
+            self.assertEqual(servers["weather"].command, "python")
+            self.assertEqual(servers["weather"].args, ["-m", "toml_weather"])
+            self.assertTrue(servers["weather"].required)
+            self.assertEqual(servers["search"].command, "uvx")
+            self.assertFalse(servers["search"].required)
+            self.assertEqual(config.mcp_json_server_names, ("search",))
+
+    def test_config_supports_servers_key_disabled_and_missing_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".mcp.json").write_text(
+                json.dumps(
+                    {
+                        "servers": {
+                            "enabled_server": {
+                                "command": "node",
+                                "args": ["server.js"],
+                                "required": True,
+                                "exposed_tools": ["get_weather"],
+                                "hidden_tools": ["refresh_cache"],
+                            },
+                            "disabled_server": {"command": "node", "disabled": True},
+                            "also_disabled": {"command": "node", "enabled": False},
+                            "missing_command": {"args": ["server.js"]},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "token", "OPENAI_API_KEY": "key"},
+                clear=False,
+            ):
+                with self.assertLogs("herobot.core.config", level="WARNING"):
+                    config = load_config(root / "missing.toml")
+
+            servers = {server.name: server for server in config.mcp_servers}
+            self.assertIn("enabled_server", servers)
+            self.assertNotIn("disabled_server", servers)
+            self.assertNotIn("also_disabled", servers)
+            self.assertNotIn("missing_command", servers)
+            self.assertTrue(servers["enabled_server"].required)
+            self.assertEqual(servers["enabled_server"].exposed_tools, ["get_weather"])
+            self.assertEqual(servers["enabled_server"].hidden_tools, ["refresh_cache"])
+
+    def test_mcp_json_example_is_parseable(self) -> None:
+        payload = json.loads(Path("mcp.json.example").read_text(encoding="utf-8"))
+
+        self.assertIn("mcpServers", payload)
+        self.assertIn("weather", payload["mcpServers"])
+        self.assertEqual(payload["mcpServers"]["weather"]["command"], "npx")
+
+    def test_config_rejects_malformed_mcp_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mcp.json").write_text("{not json", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "token", "OPENAI_API_KEY": "key"},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Invalid MCP JSON config"):
+                    load_config(root / "missing.toml")
+
     def test_context_from_payload_requires_chat_and_user(self) -> None:
         with self.assertRaisesRegex(ValueError, "chat_id"):
             context_from_payload({"herobot_context": {"user_id": 20}})
@@ -204,6 +344,26 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.choices[0].message.content, "ok")
         self.assertEqual(completions.calls, 2)
+
+    async def test_llm_chat_does_not_retry_bad_request(self) -> None:
+        llm = LLMClient(
+            LLMConfig(
+                api_key="key",
+                base_url="http://localhost:4000",
+                model="model",
+                timeout_seconds=1,
+                max_retries=2,
+                retry_base_delay_seconds=0,
+            )
+        )
+        completions = FakeCompletions([FakeStatusError("bad request", status_code=400)])
+        llm.client = FakeOpenAIClient(completions)
+
+        with self.assertLogs("herobot.llm", level="ERROR"):
+            with self.assertRaises(FakeStatusError):
+                await llm.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(completions.calls, 1)
 
     async def test_llm_summarize_uses_json_message_format(self) -> None:
         llm = LLMClient(
@@ -409,6 +569,31 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(notes[0]["content"], "放在抽屉里")
             fuzzy_notes = await storage.search_notes_by_terms(10, ["护照"])
             self.assertEqual(fuzzy_notes[0]["title"], "护照")
+
+            profile = await tools.invoke(
+                "create_note",
+                {
+                    "title": "个人信息",
+                    "content": "我是山西人，老家是晋城高平市，现在在上海读书。",
+                },
+                context,
+            )
+            self.assertTrue(profile["ok"])
+            self.assertEqual((await storage.search_notes(10, "山西"))[0]["title"], "个人信息")
+            self.assertEqual((await storage.search_notes(10, "晋城"))[0]["title"], "个人信息")
+            self.assertEqual((await storage.search_notes(10, "上海"))[0]["title"], "个人信息")
+
+            server = await tools.invoke(
+                "create_note",
+                {
+                    "title": "服务器",
+                    "content": "本地 LLM API 在 localhost:4000",
+                },
+                context,
+            )
+            self.assertTrue(server["ok"])
+            self.assertEqual((await storage.search_notes(10, "localhost"))[0]["title"], "服务器")
+            self.assertEqual((await storage.search_notes(10, "4000"))[0]["title"], "服务器")
 
     async def test_reminder_time_is_stored_as_utc(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -800,6 +985,264 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
 
+    async def test_agent_max_steps_does_not_warn_after_user_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            registry = FakeRegistry()
+            llm = FakeLLM(
+                [
+                    json.dumps(
+                        {
+                            "goal": "回答天气是否适合出门",
+                            "subtasks": ["回复用户"],
+                            "completion_conditions": ["给用户可观察回复"],
+                            "expected_messages": [],
+                            "requires_user_input": False,
+                            "requires_external_response": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    [
+                        FakeToolCall(
+                            "1",
+                            "send_telegram_message",
+                            {"text": "上海闵行今天适合出门，注意防晒。"},
+                        )
+                    ],
+                ]
+            )
+            agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=1)
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="group",
+                message_id=1,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="今天上海闵行天气怎么样？适合出门吗",
+                addressed_to_self=True,
+            )
+            platform = RecordingPlatformTools()
+
+            await agent.handle_event(event, platform)
+
+            sent = [args["text"] for name, args in platform.calls if name == "send_telegram_message"]
+            finishes = [args for name, args in platform.calls if name == "finish_task"]
+            self.assertEqual(sent, ["上海闵行今天适合出门，注意防晒。"])
+            self.assertEqual(finishes[-1]["status"], "done")
+            self.assertFalse(finishes[-1]["needs_user_input"])
+
+    async def test_agent_max_steps_does_not_warn_after_response_with_tool_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            registry = FakeFailingWeatherRegistry()
+            llm = FakeLLM(
+                [
+                    json.dumps(
+                        {
+                            "goal": "查询天气并回复用户",
+                            "subtasks": ["查询天气", "回复用户"],
+                            "completion_conditions": ["给用户可观察回复"],
+                            "expected_messages": [],
+                            "requires_user_input": False,
+                            "requires_external_response": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    [
+                        FakeToolCall("1", "get_weather", {"location": "上海交大"}),
+                        FakeToolCall(
+                            "2",
+                            "send_telegram_message",
+                            {"text": "上海交大今天适合出门，注意防晒。"},
+                        ),
+                    ],
+                ]
+            )
+            agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=1)
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="group",
+                message_id=1,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="帮我查一下今天上海交大天气怎么样",
+                addressed_to_self=True,
+            )
+            platform = RecordingPlatformTools()
+
+            await agent.handle_event(event, platform)
+
+            sent = [args["text"] for name, args in platform.calls if name == "send_telegram_message"]
+            finishes = [args for name, args in platform.calls if name == "finish_task"]
+            self.assertEqual(sent, ["上海交大今天适合出门，注意防晒。"])
+            self.assertEqual(finishes[-1]["status"], "failed")
+            self.assertFalse(finishes[-1]["needs_user_input"])
+
+    async def test_agent_finish_after_user_response_skips_llm_finish_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            registry = FakeRegistry()
+            llm = FakeLLM(
+                [
+                    json.dumps(
+                        {
+                            "goal": "回复天气",
+                            "subtasks": ["回复用户"],
+                            "completion_conditions": ["已回复用户"],
+                            "expected_messages": [],
+                            "requires_user_input": False,
+                            "requires_external_response": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    [
+                        FakeToolCall(
+                            "1",
+                            "send_telegram_message",
+                            {"text": "上海交大今天适合出门。"},
+                        ),
+                        FakeToolCall(
+                            "2",
+                            "finish_task",
+                            {
+                                "status": "done",
+                                "summary": "weather answered",
+                                "needs_user_input": False,
+                            },
+                        ),
+                    ],
+                ]
+            )
+            agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=3)
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="group",
+                message_id=1,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="帮我查一下今天上海交大天气怎么样",
+                addressed_to_self=True,
+            )
+            platform = RecordingPlatformTools()
+
+            await agent.handle_event(event, platform)
+
+            self.assertTrue(platform.finished)
+            self.assertEqual(llm.calls, 2)
+
+    async def test_agent_max_steps_warns_when_expected_messages_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            registry = FakeRegistry()
+            llm = FakeLLM(
+                [
+                    json.dumps(
+                        {
+                            "goal": "挨个报数到2",
+                            "subtasks": ["发送 1", "发送 2"],
+                            "completion_conditions": ["必须发送 1、2 两条独立消息"],
+                            "expected_messages": ["1", "2"],
+                            "requires_user_input": False,
+                            "requires_external_response": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    [FakeToolCall("1", "send_telegram_message", {"text": "1"})],
+                ]
+            )
+            agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=1)
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="group",
+                message_id=1,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="挨个报数，数到2",
+                addressed_to_self=True,
+            )
+            platform = RecordingPlatformTools()
+
+            await agent.handle_event(event, platform)
+
+            sent = [args["text"] for name, args in platform.calls if name == "send_telegram_message"]
+            finishes = [args for name, args in platform.calls if name == "finish_task"]
+            self.assertEqual(sent[0], "1")
+            self.assertIn("执行步数达到了上限", sent[1])
+            self.assertEqual(finishes[-1]["status"], "failed")
+            self.assertTrue(finishes[-1]["needs_user_input"])
+
+    async def test_agent_recovers_when_llm_fails_after_side_effect_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = ConversationStore(str(Path(tmp) / "core.sqlite3"))
+            self.addAsyncCleanup(storage.close)
+            await storage.init()
+            registry = FakeSideEffectRegistry()
+            llm = FakeLLM(
+                [
+                    json.dumps(
+                        {
+                            "goal": "记录用户个人信息",
+                            "subtasks": ["保存笔记", "回复用户"],
+                            "completion_conditions": ["信息保存成功并回复用户"],
+                            "expected_messages": [],
+                            "requires_user_input": False,
+                            "requires_external_response": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    [
+                        FakeToolCall(
+                            "1",
+                            "create_note",
+                            {
+                                "title": "个人信息",
+                                "content": "用户是山西人，老家是晋城高平市，现在在上海读书。",
+                            },
+                        )
+                    ],
+                    RuntimeError("upstream chat-completions failed after tool result"),
+                ]
+            )
+            agent = Agent(storage=storage, llm=llm, tool_registry=registry, max_steps=3)
+            event = AgentEvent(
+                source="telegram",
+                chat_id=10,
+                chat_type="group",
+                message_id=1,
+                sender_id=20,
+                sender_username="tester",
+                sender_is_bot=False,
+                text="记住，我是山西人，我的老家是晋城高平市，我现在在上海读书",
+                addressed_to_self=True,
+            )
+            platform = RecordingPlatformTools()
+
+            with self.assertLogs("herobot.agent.runtime", level="ERROR"):
+                await agent.handle_event(event, platform)
+
+            self.assertEqual(registry.calls[0][0], "create_note")
+            sent = [args["text"] for name, args in platform.calls if name == "send_telegram_message"]
+            finishes = [args for name, args in platform.calls if name == "finish_task"]
+            self.assertEqual(sent, ["已记录。"])
+            self.assertEqual(finishes[-1]["status"], "done")
+            self.assertFalse(finishes[-1]["needs_user_input"])
+
     async def test_telegram_platform_retries_when_reply_message_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = ConversationStore(str(Path(tmp) / "platform.sqlite3"))
@@ -923,12 +1366,16 @@ class FakeResponse:
 class FakeLLM:
     def __init__(self, responses) -> None:
         self.responses = list(responses)
+        self.calls = 0
 
     async def chat(self, messages, tools=None, tool_choice="auto"):
         del messages, tools, tool_choice
+        self.calls += 1
         if not self.responses:
             return FakeResponse(FakeMessage([]))
         response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
         if isinstance(response, str):
             return FakeResponse(FakeMessage(content=response))
         return FakeResponse(FakeMessage(response))
@@ -975,6 +1422,12 @@ class FakeOpenAIClient:
         self.chat = FakeOpenAIChat(completions)
 
 
+class FakeStatusError(Exception):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class FakeConversationStore:
     pass
 
@@ -990,6 +1443,73 @@ class FakeRegistry:
 
     async def close(self):
         return None
+
+
+class FakeSideEffectRegistry(FakeRegistry):
+    tool_names = {"create_note"}
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def openai_tool_schemas(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_note",
+                    "description": "Create a personal note.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["title", "content"],
+                    },
+                },
+            }
+        ]
+
+    async def call(self, name, arguments, context):
+        self.calls.append((name, arguments, context))
+        return json.dumps(
+            {
+                "ok": True,
+                "result": {
+                    "id": 1,
+                    "title": arguments.get("title"),
+                    "content": arguments.get("content"),
+                },
+            },
+            ensure_ascii=False,
+        )
+
+
+class FakeFailingWeatherRegistry(FakeRegistry):
+    tool_names = {"get_weather"}
+
+    def openai_tool_schemas(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather by location.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+    async def call(self, name, arguments, context):
+        del name, arguments, context
+        return json.dumps(
+            {"ok": False, "error": "weather provider returned partial data"},
+            ensure_ascii=False,
+        )
 
 
 class FakeHiddenRegistry:

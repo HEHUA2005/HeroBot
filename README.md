@@ -1,80 +1,171 @@
 # HeroBot
 
-HeroBot 是一个运行在 Telegram 上的个人助理 Agent。现在的定位是：
+[![CI](https://github.com/HEHUA2005/HeroBot/actions/workflows/ci.yml/badge.svg)](https://github.com/HEHUA2005/HeroBot/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
+![MCP](https://img.shields.io/badge/MCP-stdio-green)
+
+HeroBot is a Telegram-native personal assistant Agent. It keeps Telegram as a thin
+message interface, runs a ReAct-style Agent runtime, and exposes business capabilities
+through pluggable MCP servers.
 
 ```text
 Telegram Core -> Agent Runtime -> MCP Host -> MCP Servers
 ```
 
-Telegram 只负责接收和发送消息；Agent 负责 ReAct-style 决策；业务能力由 MCP server 插拔提供。HeroBot 自带 notes 和 calendar 两个 MCP server，也可以通过 `herobot.toml` 接入外部 MCP server。
+HeroBot ships with local notes and calendar MCP servers, and can also load community
+`mcpServers` JSON configs such as `mcp.json` / `.mcp.json`.
 
-## Architecture
+## Highlights
 
-```text
-Telegram Update
-  -> Telegram Adapter
-  -> AgentEvent
-  -> ReAct Agent Runtime
-      -> Planner LLM
-         - TaskFrame
-      -> ActionLedger
-      -> FinishGuard
-      -> Internal Platform Tools
-         - send_telegram_message
-         - send_telegram_messages
-         - finish_task
-      -> MCP Host
-         -> herobot-mcp-notes
-            - notes
-            - todos
-         -> herobot-mcp-calendar
-            - contacts
-            - reminders
-            - calendar
-            - availability
-            - scheduling
-         -> external MCP servers
-```
+- Minimal Telegram core: receive updates, authorize users, build Agent events, send replies.
+- ReAct Agent runtime: planning, tool calls, action ledger, finish guard, bounded max steps.
+- Pluggable MCP host: builtin notes/calendar plus external stdio MCP servers.
+- Personal assistant tools: notes, todos, reminders, contacts, calendar events, availability.
+- Bot-to-bot scheduling: assistants can negotiate candidate times in a shared Telegram group.
+- Local-first storage: SQLite databases for builtin business tools.
+- CI-backed test suite: compile check and unittest on Python 3.12.
 
-关键边界：
+## Quick Start
 
-- `bot.py` 只负责 CLI/bootstrap。
-- `core/` 负责配置、鉴权、最小 conversation store、app lifecycle 和 scheduler。
-- `telegram/` 负责 Telegram update 处理、命令 alias、消息发送平台工具。
-- `agent/` 负责 Planner、ReAct loop、ActionLedger、FinishGuard 和上下文构造。
-- `mcp/registry.py` 是通用 MCP Host，支持多个 stdio MCP server。
-- `mcp/builtin/` 是 HeroBot 自带 MCP server；外部 MCP server 不需要放进本 repo。
-
-## Requirements
+Requirements:
 
 - Python 3.12+
 - pyenv / pyenv-virtualenv
-- Telegram BotFather 创建的 bot token
+- Telegram bot token from BotFather
 - OpenAI-compatible LLM API
 - SQLite
 
-## Installation
+Install:
 
 ```bash
 pyenv virtualenv 3.12.9 herobot
 pyenv local herobot
 pip install -e .
+
 cp .env.example .env
 cp herobot.toml.example herobot.toml
 ```
 
-安装后会注册：
+Edit `.env`:
+
+```bash
+TELEGRAM_BOT_TOKEN=replace-with-your-token
+TELEGRAM_ENABLE_USER_WHITELIST=true
+TELEGRAM_ALLOWED_USER_IDS=123456789
+
+OPENAI_API_KEY=replace-with-your-api-key
+OPENAI_BASE_URL=http://localhost:4000
+OPENAI_MODEL=your-model
+
+HEROBOT_DEFAULT_TIMEZONE=Asia/Shanghai
+HEROBOT_MAX_AGENT_STEPS=8
+```
+
+Run:
+
+```bash
+herobot
+```
+
+If you run multiple bot instances:
+
+```bash
+herobot-multi --env-dir instances
+```
+
+`herobot-multi` starts one process per `instances/*.env` file and automatically pairs
+`instances/foo.env` with `instances/foo.toml` when the TOML file exists.
+
+## What It Can Do
+
+The builtin MCP servers provide:
+
+- Notes and todos: create todos, list todos, complete todos, save notes, search notes.
+- Calendar: reminders, contacts, calendar events, availability, scheduling sessions.
+- Scheduler: checks hidden reminder tools and sends Telegram reminders when due.
+
+Example Telegram prompts:
 
 ```text
-herobot              # 启动单个 Telegram bot 实例
-herobot-multi        # 从 instances/*.env 批量启动多个实例
-herobot-mcp-notes    # notes/todos MCP server
-herobot-mcp-calendar # calendar/contacts/reminders/scheduling MCP server
+帮我记一下：护照放在书桌右边抽屉里
+添加联系人 李雷 @HEHUAone_bot
+我明天 14:00-16:00 要和 mentor 开会
+@super666666_bot 帮我和李雷约明天下午 30 分钟
+@super666666_bot 帮我问问 @HEHUAone_bot 能做啥
 ```
+
+## MCP Extensions
+
+HeroBot can load external MCP servers in two ways.
+
+### Option 1: Community JSON Config
+
+Put a community-style MCP config in `mcp.json` or `.mcp.json` at the project root:
+
+```json
+{
+  "mcpServers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@dangahagan/weather-mcp@latest"]
+    }
+  }
+}
+```
+
+VS Code-style `servers` is also supported:
+
+```json
+{
+  "servers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@dangahagan/weather-mcp@latest"]
+    }
+  }
+}
+```
+
+JSON-configured external servers are optional by default, so a broken community MCP
+server will not prevent HeroBot from starting.
+
+Use the example file as a starting point:
+
+```bash
+cp mcp.json.example mcp.json
+```
+
+Real `mcp.json` and `.mcp.json` files are ignored by git because they may contain local
+paths or API keys.
+
+### Option 2: HeroBot TOML Config
+
+Use `herobot.toml` when you need HeroBot-specific fields such as `hidden_tools`,
+`exposed_tools`, or `timeout_seconds`:
+
+```toml
+[[mcp.servers]]
+name = "weather"
+command = "python"
+args = ["-m", "my_weather_mcp"]
+enabled = true
+required = false
+exposed_tools = []
+hidden_tools = []
+timeout_seconds = 30
+```
+
+If a server name appears in both `herobot.toml` and `mcp.json`, the TOML server wins and
+the JSON server is skipped with a warning.
+
+Full guide: [Adding an MCP Server to HeroBot](doc/adding-mcp-server.md).
 
 ## Configuration
 
-`.env` 放 token、LLM key、实例人格和 DB fallback：
+HeroBot uses `.env` for secrets and instance-level runtime settings, and `herobot.toml`
+for structured app configuration.
+
+Common `.env` settings:
 
 ```bash
 TELEGRAM_BOT_TOKEN=replace-with-your-token
@@ -96,7 +187,7 @@ ENABLE_BOT_TO_BOT=false
 TELEGRAM_ALLOWED_BOT_USERNAMES=other_bot,review_bot
 ```
 
-`herobot.toml` 放 MCP server 和命令 alias：
+Minimal `herobot.toml`:
 
 ```toml
 [commands.aliases]
@@ -121,74 +212,64 @@ timeout_seconds = 30
 env = { HEROBOT_CALENDAR_DB_PATH = "data/herobot-calendar.sqlite3" }
 ```
 
-外部 MCP server 插拔示例：
+If `herobot.toml` is missing, HeroBot starts with builtin notes/calendar defaults and
+still appends external servers from `mcp.json` / `.mcp.json`.
 
-```toml
-[[mcp.servers]]
-name = "weather"
-command = "python"
-args = ["-m", "my_weather_mcp"]
-enabled = true
-required = false
-exposed_tools = []
-hidden_tools = []
-timeout_seconds = 30
-```
-
-如果没有 `herobot.toml`，HeroBot 会使用内置默认配置并启动 notes/calendar 两个 builtin MCP server。旧 `HEROBOT_DB_PATH` 会作为 core、notes、calendar 的兼容 fallback。
-
-## Running
-
-启动单个实例：
-
-```bash
-herobot
-```
-
-指定 env 和 config：
-
-```bash
-herobot --env-file instances/super666666.env --config instances/super666666.toml
-```
-
-批量启动：
-
-```bash
-herobot-multi --env-dir instances
-```
-
-`herobot-multi` 会自动为 `instances/foo.env` 配对 `instances/foo.toml`，如果 TOML 不存在则使用默认配置。
-
-同一个 Telegram bot token 只能有一个 polling 进程。如果看到 `409 Conflict`，说明同一个 token 被多个进程同时使用。
-
-## Capabilities
-
-内置 MCP server 当前提供：
-
-- notes/todos：创建待办、查询待办、完成待办、保存笔记、搜索笔记。
-- calendar：创建提醒、查询提醒、联系人管理、创建日程、查询日程、计算空闲时间、助理间约时间。
-- scheduler：通过 calendar MCP 的 hidden tools 查询到期提醒，再由 Telegram adapter 发送提醒。
-
-示例：
+## Architecture
 
 ```text
-帮我记一下：护照放在书桌右边抽屉里
-添加联系人 李雷 @HEHUAone_bot
-我明天 14:00-16:00 要和 mentor 开会
-@super666666_bot 帮我和李雷约明天下午 30 分钟
-@super666666_bot 帮我问问 @HEHUAone_bot 能做啥
+Telegram Update
+  -> Telegram Adapter
+  -> AgentEvent
+  -> ReAct Agent Runtime
+      -> Planner LLM
+      -> ActionLedger
+      -> FinishGuard
+      -> Internal Platform Tools
+         - send_telegram_message
+         - send_telegram_messages
+         - finish_task
+      -> MCP Host
+         -> herobot-mcp-notes
+            - notes
+            - todos
+         -> herobot-mcp-calendar
+            - contacts
+            - reminders
+            - calendar
+            - availability
+            - scheduling
+         -> external MCP servers
 ```
+
+Key boundaries:
+
+- `bot.py`: CLI/bootstrap only.
+- `core/`: configuration, authorization, conversation store, lifecycle, scheduler.
+- `telegram/`: Telegram update handling, command aliases, platform tools.
+- `agent/`: ReAct loop, planning, action ledger, finish guard, context construction.
+- `mcp/registry.py`: generic stdio MCP host.
+- `mcp/builtin/`: HeroBot-provided MCP servers. External MCP servers do not need to live in this repo.
 
 ## Development
 
-常用检查：
+Installed console scripts:
+
+```text
+herobot              # run one Telegram bot instance
+herobot-multi        # run multiple instances from instances/*.env
+herobot-mcp-notes    # notes/todos MCP server
+herobot-mcp-calendar # calendar/contacts/reminders/scheduling MCP server
+```
+
+Useful checks:
 
 ```bash
 python -m compileall src tests
 python -m unittest discover -s tests
 ```
 
-项目结构：
+Project layout:
 
 ```text
 src/herobot/
@@ -205,9 +286,17 @@ src/herobot/
       calendar/
 ```
 
+## Troubleshooting
+
+- `409 Conflict`: the same Telegram bot token is already being polled by another process.
+- External MCP server does not appear: check `herobot` startup logs for loaded JSON configs and skipped duplicate names.
+- `npx` MCP server fails: confirm Node.js and `npx` are installed in the same environment that starts HeroBot.
+- Bot does not respond in a group: mention the bot first, and check whitelist / bot-to-bot settings.
+
 ## Security Notes
 
-- 不要提交 `.env`、`instances/*.env`、SQLite 数据库或任何真实 token。
-- 如果 bot token 曾经暴露，应在 BotFather 中重新生成。
-- bot-to-bot 群聊测试建议使用 `TELEGRAM_ALLOWED_BOT_USERNAMES` 控制可交互 bot。
-- `send_telegram_message` 只能向当前 chat 发送消息，不支持任意 chat id，避免 Agent 越权发消息。
+- Do not commit `.env`, `instances/*.env`, SQLite databases, real tokens, or real `mcp.json` files.
+- If a bot token was exposed, regenerate it in BotFather.
+- Keep `TELEGRAM_ENABLE_USER_WHITELIST=true` for personal assistants.
+- Use `TELEGRAM_ALLOWED_BOT_USERNAMES` to constrain bot-to-bot experiments.
+- `send_telegram_message` can only send to the current chat, not arbitrary chat IDs.
